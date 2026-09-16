@@ -1736,7 +1736,6 @@ def _absolute_text_position_ids(
     cold text-only prefill and cache-hit tails, and makes partial-prefix reuse
     match full prefill.
     """
-    offset = _cache_offset_for_position_ids(cache, language_model)
     if input_ids.ndim == 1:
         batch_size = 1
         seq_len = input_ids.shape[0]
@@ -1745,6 +1744,20 @@ def _absolute_text_position_ids(
         seq_len = input_ids.shape[1]
     if seq_len <= 0:
         return None
+    # Qwen attention may need a scalar physical width through its compatibility
+    # proxy, but RoPE positions belong to each request's unpadded history.
+    # Read the underlying batch offset before falling back to the singleton
+    # contract; broadcasting the proxy's maximum shifts every shorter row.
+    fa_idx = getattr(getattr(language_model, "model", None), "fa_idx", None)
+    if cache and isinstance(fa_idx, int) and 0 <= fa_idx < len(cache):
+        anchor = getattr(cache[fa_idx], "_inner", cache[fa_idx])
+        offsets = getattr(anchor, "offset", None)
+        if isinstance(offsets, mx.array) and offsets.ndim == 1:
+            if offsets.size != batch_size:
+                raise ValueError("Qwen position offsets do not match the request batch")
+            pos = mx.maximum(offsets, 0)[:, None] + mx.arange(seq_len)[None, :]
+            return mx.broadcast_to(pos[None, ...], (3, batch_size, seq_len))
+    offset = _cache_offset_for_position_ids(cache, language_model)
     pos = mx.arange(offset, offset + seq_len, dtype=mx.int32).reshape(1, seq_len)
     pos = mx.broadcast_to(pos, (batch_size, seq_len))
     return mx.broadcast_to(pos[None, ...], (3, batch_size, seq_len))

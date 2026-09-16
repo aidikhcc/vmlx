@@ -51,6 +51,7 @@ from mlx_vlm.models.qwen3_5.language import (
 )
 
 from vmlx_engine.models.minimax_m3.cache import (
+    BatchMiniMaxM3SparseCache as _BatchSparseIndexerKVCache,
     MiniMaxM3SparseCache as _SparseIndexerKVCache,
 )
 from vmlx_engine.native_mtp_prompt_priming import (
@@ -1576,6 +1577,42 @@ class QSAIndexer(nn.Module):
             all_payload = cache.update_index(payload[:, None, :, :])[:, 0, :, :]
         else:
             all_payload = payload
+
+        batch_cache = getattr(cache, "_inner", cache)
+        if S == 1 and not return_blocks and isinstance(batch_cache, _BatchSparseIndexerKVCache):
+            padding = batch_cache.left_padding.tolist()
+            if any(padding) and max(padding) < all_payload.shape[1]:
+                # A merged cache is right-aligned. Pooling physical columns
+                # would move a shorter row's four-token block boundaries and
+                # can select padding as real history. Select each logical row,
+                # then put its additive mask back in the physical coordinates.
+                # This owns post-prefill AR only: no pending padded queries,
+                # multi-token prefill, or direct-block verification contract.
+                width = all_payload.shape[1]
+                first_query = width - S
+                masks = []
+                for row, pad in enumerate(padding):
+                    row_mask = self._mask_from_payload(
+                        q[row : row + 1],
+                        all_payload[row : row + 1, pad:],
+                        cache=None,
+                        offset=first_query - pad,
+                        return_blocks=False,
+                    )
+                    if row_mask is None:
+                        row_mask = mx.zeros((1, 1, S, width - pad))
+                    masks.append(mx.pad(
+                        row_mask, [(0, 0), (0, 0), (0, 0), (pad, 0)],
+                        constant_values=-float("inf"),
+                    ))
+                return mx.concatenate(masks, axis=0)
+        return self._mask_from_payload(
+            q, all_payload, cache=cache, offset=offset, return_blocks=return_blocks
+        )
+
+    def _mask_from_payload(self, q, all_payload, *, cache, offset, return_blocks):
+        """Select logical four-token blocks; callers own physical padding."""
+        B, S = q.shape[:2]
         all_keys = all_payload[..., : self.head_dim]
         all_positions = all_payload[..., self.head_dim :]
         T = all_payload.shape[1]
