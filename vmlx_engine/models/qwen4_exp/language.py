@@ -39,6 +39,9 @@ from vmlx_engine.metal.qwen4_hc_norm import (
     hc_combine_norm_requested,
     hc_combine_norm,
 )
+from vmlx_engine.metal.qwen4_hc_up_mix import (
+    hc_up_mix_requested, hc_up_mix_scope_eligible, hc_up_mix,
+)
 from vmlx_engine.metal.qwen4_gdn_prework import (
     gdn_prework_requested, gdn_prework_update,
 )
@@ -575,6 +578,7 @@ class GatedResidual(nn.Module):
         super().__init__()
         self._exact_combine = exact_hc_combine_requested()
         self._combine_norm = hc_combine_norm_requested()
+        self._hc_up_mix = hc_up_mix_requested()
         self._hc_view_split = os.environ.get("VMLX_QWEN4_HC_VIEW_SPLIT") == "1"
         self.hc_count = args.hc_count
         self.hidden_size = args.hidden_size
@@ -597,6 +601,14 @@ class GatedResidual(nn.Module):
                 f"got {hyper_input.shape[-1]}"
             )
         compiled_forward = getattr(self, "_compiled_forward", None)
+        if self._use_up_mix(hyper_input):
+            if compiled_forward is not None:
+                forward = getattr(self, "_compiled_up_mix_forward", None)
+                if forward is None:
+                    forward = mx.compile(self._forward_up_mix)
+                    self._compiled_up_mix_forward = forward
+                return forward(hyper_input)
+            return self._forward_up_mix(hyper_input)
         if (
             compiled_forward is not None
             and 1 <= hyper_input.shape[-2] <= _hc_compile_max_rows()
@@ -608,8 +620,30 @@ class GatedResidual(nn.Module):
         normed = self.hc_norm(hyper_input)
         return self._forward_normed(hyper_input, normed)
 
+    def _use_up_mix(self, hyper_input: mx.array) -> bool:
+        # The selection is outside cached tracing. A stock single-row prefill
+        # trace cannot bypass the AR candidate, nor can AR enable it in MTP.
+        return (self._hc_up_mix and not self.training
+                and hc_up_mix_scope_eligible(
+                    hyper_input, hc_count=self.hc_count,
+                    hidden_size=self.hidden_size, enabled=True))
+
+    def _forward_up_mix(self, hyper_input: mx.array):
+        return self._forward_normed_up_mix(hyper_input, self.hc_norm(hyper_input))
+
+    def _forward_normed_up_mix(self, hyper_input: mx.array, normed: mx.array):
+        return self._forward_normed(hyper_input, normed, fused_up=True)
+
     def from_normed(self, hyper_input: mx.array, normed: mx.array):
         """Use the existing projections after an admitted combine/norm graph."""
+        if self._use_up_mix(hyper_input):
+            if getattr(self, "_compiled_forward", None) is not None:
+                forward = getattr(self, "_compiled_normed_up_mix_forward", None)
+                if forward is None:
+                    forward = mx.compile(self._forward_normed_up_mix)
+                    self._compiled_normed_up_mix_forward = forward
+                return forward(hyper_input, normed)
+            return self._forward_normed_up_mix(hyper_input, normed)
         if getattr(self, "_compiled_forward", None) is not None:
             forward = getattr(self, "_compiled_normed_forward", None)
             if forward is None:
@@ -618,7 +652,7 @@ class GatedResidual(nn.Module):
             return forward(hyper_input, normed)
         return self._forward_normed(hyper_input, normed)
 
-    def _forward_normed(self, hyper_input: mx.array, normed: mx.array):
+    def _forward_normed(self, hyper_input: mx.array, normed: mx.array, *, fused_up=False):
         input_inject_weight = getattr(self, "input_inject_weight", None)
         view_split = (
             self._hc_view_split
@@ -649,12 +683,18 @@ class GatedResidual(nn.Module):
             # a row-contiguous copy changes GEMM traversal and FP16 rounding.
             # Preserve that layout, including flattened batch/token axes.
             mix = _hyper_column_major_rows(mix)
-        mix = mx.sigmoid(self.input_mix_weight_up(mix))
-        mix = mix.astype(normed.dtype)
-        mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
-        mixed = (
-            mix * normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
-        ).mean(-2).astype(hyper_input.dtype)
+        mixed = None
+        if fused_up:
+            mixed = hc_up_mix(
+                self.input_mix_weight_up, mix, normed, hc_count=self.hc_count,
+                hidden_size=self.hidden_size, enabled=True)
+        if mixed is None:
+            mix = mx.sigmoid(self.input_mix_weight_up(mix))
+            mix = mix.astype(normed.dtype)
+            mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
+            mixed = (
+                mix * normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
+            ).mean(-2).astype(hyper_input.dtype)
         if block_injection is None:
             return mixed
         inject_w = (
