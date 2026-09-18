@@ -1293,8 +1293,12 @@ class BatchedEngine(BaseEngine):
         # here, load the model on it, then hand the same executor to the
         # scheduler below so step() runs on the exact same worker.
         from concurrent.futures import ThreadPoolExecutor
+        from ..utils.inference_worker_qos import configure_mllm_worker_qos
+
         loader_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-worker"
+            max_workers=1,
+            thread_name_prefix="mllm-worker",
+            initializer=configure_mllm_worker_qos,
         )
         self._step_executor = loader_executor
         self._mllm_instance = MLXMultimodalLM(
