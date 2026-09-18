@@ -66,6 +66,7 @@ from vmlx_engine.native_mtp_prompt_priming import (
     capture_requested,
 )
 from vmlx_engine.metal.qwen4_affine_moe_decode import qwen4_affine_switchglu
+from vmlx_engine.metal.affine_moe_pair_decode import affine_moe_ar_scope_active
 from vmlx_engine.metal.gated_rmsnorm_decode import (
     fused_gated_rmsnorm_requested,
     sigmoid_gated_rmsnorm_small_rows,
@@ -2251,7 +2252,17 @@ class DecoderLayer(nn.Module):
         prefill_checkpoint_steps: tuple[int, ...] = (),
         last_token_only: bool = False,
         ple_prefetch=None,
+        _attn_normed=None,
+        _next_hc_norm=None,
     ):
+        # Private single-forward handoff from the preceding MLP combine. A PLE
+        # injection changes h and must never consume its pre-injection norm.
+        if _attn_normed is not None and (
+            self.ple is not None or mask is not None or self.training
+            or profile_layer is not None or n_confirmed or prefill_checkpoint_steps
+            or h.shape[:2] != (1, 1) or not affine_moe_ar_scope_active()
+        ):
+            raise ValueError("Pre-normalized HC input outside productive AR boundary")
         phase_ms: Dict[str, float] = {}
         if self.ple is not None:
             if cache is not None and prefill_checkpoint_steps:
@@ -2319,7 +2330,10 @@ class DecoderLayer(nn.Module):
             if profile_layer is not None:
                 phase_ms["ple"] = _profile_eval(h)
 
-        x, hyper, inject = self.attn_hyper_connection(h)
+        if _attn_normed is None:
+            x, hyper, inject = self.attn_hyper_connection(h)
+        else:
+            x, hyper, inject = self.attn_hyper_connection.from_normed(h, _attn_normed)
         if profile_layer is not None:
             phase_ms["attn_hc"] = _profile_eval(x)
         if self.is_linear:
@@ -2367,7 +2381,21 @@ class DecoderLayer(nn.Module):
         if profile_layer is not None:
             phase_ms["mlp_hc"] = _profile_eval(x)
         r = self.mlp(x, phase_ms if profile_layer is not None else None)
-        h = self.mlp_hyper_connection.combine(hyper, r, inject)
+        next_combined_norm = None
+        if (
+            _next_hc_norm is not None and profile_layer is None
+            and mask is None and not self.training and not n_confirmed
+            and not prefill_checkpoint_steps and not last_token_only
+        ):
+            next_combined_norm = hc_combine_norm(
+                hyper, r, inject, _next_hc_norm.weight,
+                eps=_next_hc_norm.eps, group_size=_next_hc_norm.group_size,
+                enabled=True,
+            )
+        if next_combined_norm is None:
+            h = self.mlp_hyper_connection.combine(hyper, r, inject)
+        else:
+            h, _ = next_combined_norm
         if profile_layer is not None:
             phase_ms["mlp_combine"] = _profile_eval(h)
             logger.info(
@@ -2377,6 +2405,10 @@ class DecoderLayer(nn.Module):
                 sum(phase_ms.values()),
                 ",".join(f"{name}:{value:.3f}" for name, value in phase_ms.items()),
             )
+        if _next_hc_norm is not None:
+            # The residual is already materialized; only its matching next
+            # normalization is carried, never a deferred cache/state update.
+            return h, None if next_combined_norm is None else next_combined_norm[1]
         return h
 
 
@@ -2391,6 +2423,8 @@ class Qwen4ExpTextModel(nn.Module):
         self._eager_dispatch = os.environ.get("VMLX_QWEN4_EAGER_DISPATCH", "1") == "1"
         self._eager_dispatch_logged = False
         self._ple_prefetch = os.environ.get("VMLX_QWEN4_PLE_PREFETCH") == "1"
+        self._cross_layer_hc = os.environ.get("VMLX_QWEN4_HC_CROSS_LAYER") == "1"
+        self._cross_layer_hc_graph_calls = 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
@@ -2437,6 +2471,11 @@ class Qwen4ExpTextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         _layer_fp = _layer_fingerprint_enabled(inputs)
+        cross_layer_hc = (
+            self._cross_layer_hc and inputs.shape == (1, 1)
+            and not self.training and not n_confirmed and not profile
+            and not _layer_fp and affine_moe_ar_scope_active()
+        )
         eager_dispatch = (
             self._eager_dispatch
             and not profile
@@ -2471,7 +2510,15 @@ class Qwen4ExpTextModel(nn.Module):
                         ticket = layer.ple.prepare_read(first_ids, current)
                         if ticket is not None:
                             prepared_reads[index] = ticket
+            attn_normed = None
             for layer_index, (layer, c) in enumerate(zip(self.layers, cache)):
+                next_hc_norm = None
+                if cross_layer_hc and layer_index + 1 < len(self.layers):
+                    next_layer = self.layers[layer_index + 1]
+                    if next_layer.ple is None and not next_layer.training:
+                        next_hc = next_layer.attn_hyper_connection
+                        if next_hc._combine_norm:
+                            next_hc_norm = next_hc.hc_norm
                 if _layer_fp and layer_index < 2:
                     _log_layer_fingerprint(-10 - layer_index, h, c)  # PRE: state before this layer runs
                 h = layer(
@@ -2485,11 +2532,28 @@ class Qwen4ExpTextModel(nn.Module):
                     prefill_checkpoint_steps=prefill_checkpoint_steps,
                     last_token_only=last_token_only and layer_index == len(self.layers) - 1,
                     ple_prefetch=prepared_reads.get(layer_index),
+                    _attn_normed=attn_normed,
+                    _next_hc_norm=next_hc_norm,
                 )
+                attn_normed = None
+                if next_hc_norm is not None:
+                    h, attn_normed = h
+                    if attn_normed is not None:
+                        self._cross_layer_hc_graph_calls += 1
+                        if self._cross_layer_hc_graph_calls == 1:
+                            logger.info(
+                                "Qwen cross-layer HC combine/norm graph: "
+                                "producer=%d consumer=%d scope=productive_ar "
+                                "rows=1 stream=caller pending_cache_state=false",
+                                layer_index, layer_index + 1,
+                            )
                 if eager_dispatch:
                     # Dependencies remain on the caller's MLX stream; cache
                     # consumers and terminal durability fences stay unchanged.
-                    mx.async_eval(h)
+                    if attn_normed is None:
+                        mx.async_eval(h)
+                    else:
+                        mx.async_eval(h, attn_normed)
                 if _layer_fp:
                     _log_layer_fingerprint(layer_index, h, c)
                     if layer_index < 2:
