@@ -17,6 +17,7 @@ The language core is shared by the text, image, and video lanes.
 """
 
 from dataclasses import dataclass, field, replace
+from contextlib import nullcontext
 import logging
 import os
 import time
@@ -105,6 +106,7 @@ from .ngram import NGramHasher
 from .host_profile import profile_decode_forward
 from .projection_cache import validated_projection_group
 from .media_positions import media_rope_index
+from .ple_prefill import PLEChunkReadAhead
 
 
 logger = logging.getLogger(__name__)
@@ -979,20 +981,24 @@ class PLELayer(nn.Module):
         self.conv1d_weight = mx.zeros((hc_hidden, self.conv_kernel_size))
         self._fused_conv_decode = fused_ple_conv_requested()
 
-    def prepare_read(self, input_ids, cache):
+    def read_rows(self, input_ids, cache):
+        ids = np.asarray(input_ids, dtype=np.int64)
+        prev = (np.asarray(cache[2], dtype=np.int64)
+                if cache is not None and cache[2] is not None else None)
+        return self.hasher.hash_tokens(ids, prev).reshape(-1)
+
+    def prepare_read(self, input_ids, cache, *, lookahead=False):
         """Snapshot current hashed IDs, but never advance PLE history early.
 
         _embed recomputes the selection at consumption and the table checks
         exact identity. A ticket cannot leak across a changed cache context.
         """
         table = getattr(self.ngram_embedding, "_file_backed", None)
-        if (table is None or not getattr(table, "_prefetch_enabled", False)
+        flag = "_chunk_lookahead_enabled" if lookahead else "_prefetch_enabled"
+        if (table is None or not getattr(table, flag, False)
                 or not table._host_assembly):
             return None
-        ids = np.asarray(input_ids, dtype=np.int64)
-        prev = (np.asarray(cache[2], dtype=np.int64)
-                if cache is not None and cache[2] is not None else None)
-        return table.prefetch_rows(self.hasher.hash_tokens(ids, prev).reshape(-1))
+        return table.prefetch_rows(self.read_rows(input_ids, cache), lookahead=lookahead)
 
     def _embed(
         self,
@@ -2478,6 +2484,7 @@ class Qwen4ExpTextModel(nn.Module):
         n_confirmed: int = 0,
         prefill_checkpoint_steps: tuple[int, ...] = (),
         last_token_only: bool = False,
+        ple_prepared_reads=None,
         **_kwargs,
     ):
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(inputs)
@@ -2526,7 +2533,7 @@ class Qwen4ExpTextModel(nn.Module):
             if _contiguous_state_experiment_enabled():
                 _materialize_recurrent_state(cache)
                 logger.info("QWEN4_LAYER_FP contiguous-state experiment applied before step %d", _LAYER_FP_STEPS["n"])
-        prepared_reads = {}
+        prepared_reads = dict(ple_prepared_reads or {})
         try:
             if (self._ple_prefetch and not profile and not _layer_fp
                     and 0 < inputs.shape[0] * inputs.shape[1] <= _PLE_PREFETCH_MAX_TOKENS):
@@ -2536,7 +2543,7 @@ class Qwen4ExpTextModel(nn.Module):
                 first_ids = (inputs[:, :n_confirmed]
                              if 0 < n_confirmed < inputs.shape[1] else inputs)
                 for index, (layer, current) in enumerate(zip(self.layers, cache)):
-                    if layer.ple is not None:
+                    if layer.ple is not None and index not in prepared_reads:
                         ticket = layer.ple.prepare_read(first_ids, current)
                         if ticket is not None:
                             prepared_reads[index] = ticket
@@ -2804,6 +2811,12 @@ class LanguageModel(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self._mtp_draft_head_state = _MTPDraftHeadState()
 
+    def prefill_read_ahead(self):
+        """Independent request scope, never model-global future/cache state."""
+        if os.environ.get("VMLX_QWEN4_PLE_CHUNK_LOOKAHEAD") != "1":
+            return nullcontext()
+        return PLEChunkReadAhead(self.model.layers)
+
     def prepare_mtp_draft_head(self) -> Dict[str, Any]:
         """Build an opt-in lower-bit head used only for MTP proposals.
 
@@ -2993,6 +3006,7 @@ class LanguageModel(nn.Module):
             return_expanded=True,
             n_confirmed=int(kwargs.get("n_confirmed", 0) or 0),
             prefill_checkpoint_steps=tuple(kwargs.get("prefill_checkpoint_steps", ())),
+            ple_prepared_reads=kwargs.get("ple_prepared_reads"),
             last_token_only=(
                 bool(kwargs.get("prefill_last_logits_only", False))
                 and not return_hidden and not capture_requested(self)

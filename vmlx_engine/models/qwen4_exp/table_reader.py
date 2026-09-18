@@ -39,6 +39,7 @@ _MLX_DTYPES = {
 _PARALLEL_READ_MAX_ROWS = 128
 _PARALLEL_READ_MAX_WORKERS = 16
 _PREFETCH_MAX_ROWS = 8192
+_PREFILL_LOOKAHEAD_MAX_ROWS = 65536
 _PREFETCH_MAX_PACKED_BYTES = 8 * 1024 * 1024
 _READ_ADVICE_MAX_ROWS = 128
 logger = logging.getLogger(__name__)
@@ -688,6 +689,9 @@ class FileBackedQuantizedNGramTable:
         self._parallel_read = _parallel_ple_read_requested()
         self._host_assembly = _host_ple_gather_requested()
         self._prefetch_enabled = os.environ.get("VMLX_QWEN4_PLE_PREFETCH") == "1"
+        self._chunk_lookahead_enabled = (
+            os.environ.get("VMLX_QWEN4_PLE_CHUNK_LOOKAHEAD") == "1"
+        )
         # Read-ahead changes scheduling, not the ordinary mmap I/O policy.
         # Keep pread separately selectable for qualification on cold SSD pages.
         # The existing parallel-read policy still applies to eligible gathers.
@@ -866,20 +870,24 @@ class FileBackedQuantizedNGramTable:
         hosts = self._read_host_assembled(flat_rows, profile=profile)
         return self._materialize_host_assembled(flat_rows.size, hosts, profile)
 
-    def prefetch_rows(self, flat_rows: np.ndarray) -> _PLEReadTicket | None:
+    def prefetch_rows(
+        self, flat_rows: np.ndarray, *, lookahead: bool = False
+    ) -> _PLEReadTicket | None:
         """Prepare one bounded exact selection without running MLX on a worker.
 
         Callers must consume or close the ticket in a finally block. A busy or
         oversized request uses the unchanged synchronous path, not a queue.
         """
-        if not self._prefetch_enabled or not self._host_assembly:
+        enabled = self._chunk_lookahead_enabled if lookahead else self._prefetch_enabled
+        if not enabled or not self._host_assembly:
             return None
         rows = np.array(flat_rows, dtype=np.int64, copy=True).reshape(-1)
         if rows.size and (int(rows.min()) < 0 or int(rows.max()) >= self.total_rows):
             raise IndexError("PLE prefetch row exceeds the configured n-gram table")
         if not rows.size:
             return None
-        if rows.size > _PREFETCH_MAX_ROWS:
+        max_rows = _PREFILL_LOOKAHEAD_MAX_ROWS if lookahead else _PREFETCH_MAX_ROWS
+        if rows.size > max_rows:
             self.prefetch_stats["capacity_fallbacks"] += 1
             return None
         unique = np.unique(rows)
@@ -933,9 +941,9 @@ class FileBackedQuantizedNGramTable:
             key = "consumed" if consumed else "discarded"
             if consumed and not self.prefetch_stats["consumed"]:
                 logger.info("Qwen PLE host prefetch consumed: rows=%d "
-                            "max_rows=%d max_packed_bytes=%d stream=caller "
+                            "decode_max_rows=%d prefill_max_rows=%d max_packed_bytes=%d stream=caller "
                             "serial_io=%s parallel_pool=%s",
-                            ticket.rows.size, _PREFETCH_MAX_ROWS,
+                            ticket.rows.size, _PREFETCH_MAX_ROWS, _PREFILL_LOOKAHEAD_MAX_ROWS,
                             _PREFETCH_MAX_PACKED_BYTES,
                             "pread" if self._prefetch_pread else "mmap",
                             "enabled" if self._read_pool is not None else "disabled")

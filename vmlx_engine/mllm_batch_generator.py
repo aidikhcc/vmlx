@@ -109,7 +109,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
@@ -11282,7 +11282,13 @@ class MLLMBatchGenerator:
         # stream — see module-level `_gen_stream()` docstring for the
         # JANGTQ Metal kernel + scheduler thread stream-isolation rationale.
         with _MaybeStream():
-            logits = self._run_vision_encoding_inner(request, cache)
+            factory = getattr(self.language_model, "prefill_read_ahead", None)
+            # The request owns pending host reads, including failure/cancel
+            # exits. Other families and the default-off policy are no-ops.
+            with factory() if callable(factory) else nullcontext() as read_ahead:
+                logits = self._run_vision_encoding_inner(
+                    request, cache, ple_read_ahead=read_ahead
+                )
             # Mixed-SWA prompts: snapshot the N-1 prompt-boundary
             # rotating windows NOW, before any decode step advances the
             # rings. This is the only moment the exact boundary state
@@ -11292,7 +11298,10 @@ class MLLMBatchGenerator:
             self._maybe_capture_mixed_swa_boundary(request, cache)
             return logits
 
-    def _run_vision_encoding_inner(self, request: "MLLMBatchRequest", cache: Optional[List[Any]] = None) -> "mx.array":
+    def _run_vision_encoding_inner(
+        self, request: "MLLMBatchRequest", cache: Optional[List[Any]] = None,
+        *, ple_read_ahead=None,
+    ) -> "mx.array":
         kwargs = dict(request.extra_kwargs)
         # Only pass pixel_values when non-None. Smelt-loaded models use a
         # text-only wrapper whose __call__ does NOT accept pixel_values at
@@ -12294,10 +12303,15 @@ class MLLMBatchGenerator:
                         except Exception:  # noqa: BLE001
                             _active_before_chunk = 0
                     try:
+                        _chunk_kwargs = _lm_kwargs_for(processed, processed + chunk_size)
+                        if ple_read_ahead is not None:
+                            _chunk_kwargs["ple_prepared_reads"] = ple_read_ahead.take(
+                                chunk, cache
+                            )
                         _call_lm_prefix_without_logits(
                             lm,
                             chunk,
-                            _lm_kwargs_for(processed, processed + chunk_size),
+                            _chunk_kwargs,
                         )
                     except Exception as chunk_err:
                         # Log cache state at failure point for diagnosis
@@ -12320,6 +12334,29 @@ class MLLMBatchGenerator:
                         )
                         _restore_kv_step()
                         raise
+                    if ple_read_ahead is not None:
+                        # The graph has advanced native PLE history, but its
+                        # blocking GPU eval is still ahead. Read the predicted
+                        # next chunk on the host during that GPU work. A later
+                        # adaptive resize is revalidated by take(), not forced
+                        # to fit this prediction. Never prefetch unknown decode.
+                        _next_start = processed + chunk_size
+                        _next_size = min(
+                            _chunk_ceiling,
+                            max(1, _adaptive_chunk_cap) if _adaptive_chunk_active
+                            else _chunk_ceiling,
+                        )
+                        _next_end = min(seq_len - 1, _next_start + _next_size)
+                        _next_end = min(
+                            (b for b in _sorted_boundaries
+                             if _next_start < b < _next_end),
+                            default=_next_end,
+                        )
+                        try:
+                            ple_read_ahead.prepare(input_ids[:, _next_start:_next_end], cache)
+                        except BaseException:
+                            _restore_kv_step()
+                            raise
                     if _HYBRID_PREFILL_MEM_TRACE and chunk_num % 8 == 0:
                         try:
                             _m_fwd = mx.get_active_memory() / (1024**3)
