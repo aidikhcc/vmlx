@@ -13,7 +13,8 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="Metal requi
 @pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
 @pytest.mark.parametrize("inverse", [False, True])
 @pytest.mark.parametrize("rows,strided", [(1, False), (7, True), (128, False)])
-def test_words_match_reference(monkeypatch, block, dtype, inverse, rows, strided):
+@pytest.mark.parametrize("mode", ["1", "2"])
+def test_words_match_reference(monkeypatch, block, dtype, inverse, rows, strided, mode):
     mx.random.seed(1909)
     x = mx.random.normal((rows, 3 * block * (2 if strided else 1))).astype(dtype)
     if strided:
@@ -21,9 +22,9 @@ def test_words_match_reference(monkeypatch, block, dtype, inverse, rows, strided
     signs = mx.where(mx.random.uniform(shape=(3 * block,)) < 0.5, -1.0, 1.0)
     monkeypatch.setenv("VMLX_BONSAI_FUSED_RHT", "0")
     ref = hadamard_activation(x, block, signs, inverse=inverse)
-    monkeypatch.setenv("VMLX_BONSAI_FUSED_RHT", "1")
+    monkeypatch.setenv("VMLX_BONSAI_FUSED_RHT", mode)
     got = hadamard_activation(x, block, signs, inverse=inverse)
-    direct = signed_hadamard(x, signs, block, inverse=inverse)
+    direct = signed_hadamard(x, signs, block, inverse=inverse, prepared=mode == "2")
     assert direct is not None  # A fallback is not kernel qualification.
     mx.eval(ref, got)
     assert ref.dtype == got.dtype == dtype
@@ -59,3 +60,23 @@ def test_signed_zero_and_finite_extremes(monkeypatch, inverse):
     got = signed_hadamard(x, signs, 1024, inverse=inverse)
     assert got is not None
     assert np.asarray(ref).tobytes() == np.asarray(got).tobytes()
+
+
+def test_prefill_only_mode_does_not_enter_kernel_for_decode(monkeypatch):
+    import vmlx_engine.metal.jang_signed_hadamard as module
+    called = []
+    actual = module.signed_hadamard
+    def observe(x, signs, block, **kwargs):
+        called.append(tuple(x.shape))
+        return actual(x, signs, block, **kwargs)
+    monkeypatch.setattr(module, "signed_hadamard", observe)
+    monkeypatch.setenv("VMLX_BONSAI_FUSED_RHT", "3")
+    signs = mx.where(mx.arange(5120) % 3, 1.0, -1.0)
+    mx.eval(hadamard_activation(mx.ones((1, 1, 5120), dtype=mx.float16), 1024, signs))
+    assert not called
+    value = mx.ones((1, 128, 5120), dtype=mx.float16)
+    got = hadamard_activation(value, 1024, signs)
+    assert called == [(1, 128, 5120)]
+    monkeypatch.setenv("VMLX_BONSAI_FUSED_RHT", "0")
+    ref = hadamard_activation(value, 1024, signs)
+    assert np.asarray(got).tobytes() == np.asarray(ref).tobytes()

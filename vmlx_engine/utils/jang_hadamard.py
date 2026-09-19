@@ -110,9 +110,11 @@ def hadamard_activation(x: mx.array, block: int, signs: mx.array, *, inverse: bo
         raise ValueError(f"Hadamard block {block} does not divide activation width {shape[-1]}")
     # Experimental, default OFF. This only substitutes the activation transform;
     # loading, signs validation, quantization and native cache ownership stay put.
-    if compute_dtype == mx.float32 and os.environ.get("VMLX_BONSAI_FUSED_RHT") == "1":
+    rht_mode = os.environ.get("VMLX_BONSAI_FUSED_RHT", "0")
+    if (compute_dtype == mx.float32 and rht_mode in ("1", "2", "3")
+            and (rht_mode != "3" or x.size > shape[-1])):
         from vmlx_engine.metal.jang_signed_hadamard import signed_hadamard
-        fused = signed_hadamard(x, signs, block, inverse=inverse)
+        fused = signed_hadamard(x, signs, block, inverse=inverse, prepared=rht_mode != "1")
         if fused is not None:
             return fused
     x = x.astype(compute_dtype)

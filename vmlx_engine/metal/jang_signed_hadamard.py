@@ -113,7 +113,39 @@ def _kernel(block: int, inverse: bool):
     )
 
 
-def signed_hadamard(x: mx.array, signs: mx.array, block: int, *, inverse=False):
+@lru_cache(maxsize=64)
+def _prepared(shape, dtype, block, inverse):
+    # Keep the compiled function keyed/bounded by metadata, never by activation
+    # values or sign identity. Signs remain a runtime input on every call.
+    if math.prod(shape[:-1]) == 1:
+        # Measured decode control: native Hadamard with compiled elementwise
+        # boundaries is faster than the custom radix schedule at a single row.
+        @mx.compile
+        def call(x, signs):
+            value = x.astype(mx.float32)
+            if not inverse:
+                value = value * signs
+            value = mx.hadamard_transform(
+                value.reshape(-1, block), scale=1 / math.sqrt(block)
+            ).reshape(shape)
+            if inverse:
+                value = value * signs
+            return value.astype(dtype)
+    else:
+        @mx.compile
+        def call(x, signs):
+            return _kernel(block, inverse)(
+                inputs=[x, signs],
+                template=[("T", dtype), ("N", block), ("W", shape[-1]),
+                          ("INVERSE", inverse)],
+                grid=(block // 16, math.prod(shape) // block, 1),
+                threadgroup=(block // 16, 1, 1),
+                output_shapes=[shape], output_dtypes=[dtype],
+            )[0]
+    return call
+
+
+def signed_hadamard(x: mx.array, signs: mx.array, block: int, *, inverse=False, prepared=False):
     """Return a candidate result or None for a shape/dtype outside this gate."""
     if (not mx.metal.is_available() or mx.default_device() != mx.gpu
             or block not in (512, 1024, 2048, 4096)
@@ -121,6 +153,8 @@ def signed_hadamard(x: mx.array, signs: mx.array, block: int, *, inverse=False):
             or signs.dtype != mx.float32 or not x.ndim or not x.size
             or x.shape[-1] % block or signs.shape != (x.shape[-1],)):
         return None
+    if prepared:
+        return _prepared(tuple(x.shape), x.dtype, block, inverse)(x, signs)
     return _kernel(block, inverse)(
         inputs=[x, signs],
         template=[("T", x.dtype), ("N", block), ("W", x.shape[-1]),
