@@ -254,7 +254,8 @@ export function truncateStr(s: string, max: number): string {
 export function parseToolArgs(detail?: string): Record<string, any> | null {
   if (!detail) return null;
   try {
-    return JSON.parse(detail);
+    const value = JSON.parse(detail);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   } catch {
     return null;
   }
@@ -272,9 +273,18 @@ export function formatJson(s: string): string {
 /** Get a human-readable summary for a tool call header. */
 export function getToolSummary(
   name: string,
-  args: Record<string, any> | null,
+  rawArgs: Record<string, unknown> | null,
 ): { label: string; context: string } {
-  if (!args) return { label: name, context: "" };
+  if (!rawArgs) return { label: name, context: "" };
+  // Tool arguments are untrusted, including when an executor rejected them.
+  // Only scalar text belongs in the compact header; the body preserves the
+  // original JSON and error. This display view never changes execution args.
+  const args: Record<string, string> = Object.fromEntries(
+    Object.entries(rawArgs).flatMap(([key, value]) =>
+      typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))
+        ? [[key, String(value)]] : [],
+    ),
+  );
 
   switch (name) {
     case "edit_file":

@@ -119,15 +119,19 @@ export function InlineToolCall({ group, isStreaming }: InlineToolCallProps) {
 }
 
 /** Renders the expanded body content — dispatches to tool-specific renderers */
-function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: {
+export function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: {
   toolName: string
   args: Record<string, any> | null
   callingDetail?: string
   resultDetail?: string
   isError: boolean
 }) {
+  // Failed or malformed calls must show their original JSON/error, not a diff
+  // implying a successful edit. Validate before passing untrusted values to
+  // string operations or React children; model schemas are not runtime types.
+  const preview = !isError && args && typeof args.path === 'string'
   // Edit tools: show diff
-  if (toolName === 'edit_file' && args?.search_text != null && args?.replacement_text != null) {
+  if (preview && toolName === 'edit_file' && typeof args.search_text === 'string' && typeof args.replacement_text === 'string') {
     return (
       <div className="px-2.5 py-2">
         {args.path && <div className="text-[10px] text-muted-foreground/70 mb-1.5 font-mono">{args.path}</div>}
@@ -140,7 +144,7 @@ function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: 
   }
 
   // Insert text: show what's being inserted
-  if (toolName === 'insert_text' && args?.text) {
+  if (preview && toolName === 'insert_text' && typeof args.text === 'string' && Number.isInteger(args.line)) {
     return (
       <div className="px-2.5 py-2">
         {args.path && <div className="text-[10px] text-muted-foreground/70 mb-1.5 font-mono">{args.path}:{args.line}</div>}
@@ -151,7 +155,7 @@ function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: 
   }
 
   // Replace lines: show what's being replaced
-  if (toolName === 'replace_lines' && args?.text) {
+  if (preview && toolName === 'replace_lines' && typeof args.text === 'string' && Number.isInteger(args.start_line) && Number.isInteger(args.end_line)) {
     return (
       <div className="px-2.5 py-2">
         {args.path && <div className="text-[10px] text-muted-foreground/70 mb-1.5 font-mono">{args.path}:{args.start_line}-{args.end_line}</div>}
@@ -162,12 +166,14 @@ function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: 
   }
 
   // Batch edit: show each edit as a diff
-  if (toolName === 'batch_edit' && args?.edits && Array.isArray(args.edits)) {
+  if (preview && toolName === 'batch_edit' && Array.isArray(args.edits) && args.edits.every((edit: unknown) =>
+    edit !== null && typeof edit === 'object' && 'search_text' in edit && 'replacement_text' in edit &&
+    typeof edit.search_text === 'string' && typeof edit.replacement_text === 'string')) {
     return (
       <div className="px-2.5 py-2 space-y-2">
         {args.path && <div className="text-[10px] text-muted-foreground/70 font-mono">{args.path}</div>}
         {args.edits.map((edit: any, i: number) => (
-          <DiffView key={i} oldText={edit.search_text || ''} newText={edit.replacement_text || ''} />
+          <DiffView key={i} oldText={edit.search_text} newText={edit.replacement_text} />
         ))}
         {resultDetail && <div className="mt-1.5 text-[11px] text-muted-foreground/70">{resultDetail}</div>}
       </div>
@@ -175,7 +181,7 @@ function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: 
   }
 
   // Command tools: show command + output
-  if ((toolName === 'run_command' || toolName === 'git' || toolName === 'spawn_process') && args?.command) {
+  if (!isError && (toolName === 'run_command' || toolName === 'git' || toolName === 'spawn_process') && typeof args?.command === 'string') {
     return (
       <div className="px-2.5 py-2">
         <pre className="text-[11px] font-mono text-foreground/80 bg-background/50 rounded px-2 py-1 mb-1.5 overflow-x-auto">
@@ -191,7 +197,7 @@ function ToolCallBody({ toolName, args, callingDetail, resultDetail, isError }: 
   }
 
   // Write file: show content preview
-  if (toolName === 'write_file' && args?.content) {
+  if (preview && toolName === 'write_file' && typeof args.content === 'string') {
     return (
       <div className="px-2.5 py-2">
         {args.path && <div className="text-[10px] text-muted-foreground/70 mb-1.5 font-mono">{args.path}</div>}
