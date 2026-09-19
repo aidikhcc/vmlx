@@ -1493,6 +1493,70 @@ class _QSAPooledFrontier:
             self.pooled = None if keep == 0 else self.pooled[:, :keep, :]
 
 
+class _QSACapacityPooledFrontier:
+    """Ephemeral pooled keys with bounded reserve, not a new persisted lane.
+
+    Only the logical prefix is exposed. Account for the full allocated shape,
+    keep no second retained view, and let MLX preserve any live old graph view
+    during an append. Trim changes the logical extent; replacement/restore is
+    still owned by the raw cache's derived-state invalidation.
+    """
+
+    __slots__ = (
+        "_buffer", "blocks", "batch", "ratio", "reused", "recomputed", "evicted"
+    )
+    step = 256
+
+    def __init__(self, ratio: int, batch: int) -> None:
+        self._buffer: Optional[mx.array] = None
+        self.blocks = 0
+        self.batch = batch
+        self.ratio = ratio
+        self.reused = 0
+        self.recomputed = 0
+        self.evicted = 0
+
+    @property
+    def pooled(self) -> Optional[mx.array]:
+        return None if self._buffer is None else self._buffer[:, : self.blocks, :]
+
+    @property
+    def nbytes(self) -> int:
+        return 0 if self._buffer is None else int(self._buffer.nbytes)
+
+    def drop(self) -> None:
+        self._buffer = None
+        self.blocks = 0
+        self.evicted += 1
+
+    def truncate_to_tokens(self, tokens: int) -> None:
+        self.blocks = min(self.blocks, max(0, int(tokens)) // self.ratio)
+        if self.blocks == 0:
+            self._buffer = None
+
+    def append(self, new: mx.array, max_bytes: int) -> mx.array:
+        have, count = self.blocks, self.blocks + new.shape[1]
+        row_bytes = int(new.shape[0] * new.shape[2] * new.itemsize)
+        if count * row_bytes > max_bytes:
+            pooled = new if have == 0 else mx.concatenate([self.pooled, new], axis=1)
+            self.drop()
+            return pooled
+        if self._buffer is None or count > self._buffer.shape[1]:
+            capacity = min(
+                ((count + self.step - 1) // self.step) * self.step,
+                max_bytes // row_bytes,
+            )
+            reserve = mx.zeros(
+                (new.shape[0], capacity - have, new.shape[2]), dtype=new.dtype
+            )
+            self._buffer = reserve if have == 0 else mx.concatenate(
+                [self.pooled, reserve], axis=1
+            )
+        self._buffer[:, have:count, :] = new
+        self.blocks = count
+        return self.pooled
+
+
 def _exact_mrope_cos_sin(
     rotary: "Qwen3_5RotaryEmbedding", position_ids: mx.array, dtype
 ) -> tuple[mx.array, mx.array]:
@@ -1816,12 +1880,25 @@ class QSAIndexer(nn.Module):
             and type(cache) is _SparseIndexerKVCache
             and _qsa_pool_retention_enabled()
         ):
+            # Opt-in storage-only candidate. Batch/ragged caches retain their
+            # existing recompute path; no score arithmetic or SSD schema changes.
+            frontier_type = (
+                _QSACapacityPooledFrontier
+                if B == 1 and os.environ.get("VMLX_QWEN4_QSA_POOL_CAPACITY") == "1"
+                else _QSAPooledFrontier
+            )
             frontier = cache.derived.get("qsa_pooled")
-            if frontier is None or frontier.batch != B or frontier.ratio != self.compress_ratio:
-                frontier = _QSAPooledFrontier(self.compress_ratio, B)
+            if (
+                type(frontier) is not frontier_type
+                or frontier.batch != B or frontier.ratio != self.compress_ratio
+            ):
+                frontier = frontier_type(self.compress_ratio, B)
                 cache.derived["qsa_pooled"] = frontier
         if frontier is None:
             return self._pool_blocks(all_keys, all_positions, 0, num_blocks, B)
+        capacity_frontier = isinstance(frontier, _QSACapacityPooledFrontier)
+        if capacity_frontier and frontier.nbytes > _qsa_pool_retention_max_bytes():
+            frontier.drop()
         have = frontier.blocks if frontier.pooled is not None else 0
         if have > num_blocks:
             # The raw lane shrank without a trim hook firing: never trust the
@@ -1834,6 +1911,8 @@ class QSAIndexer(nn.Module):
         new = self._pool_blocks(all_keys, all_positions, have, num_blocks, B)
         frontier.recomputed += num_blocks - have
         frontier.reused += have
+        if capacity_frontier:
+            return frontier.append(new, _qsa_pool_retention_max_bytes())
         pooled = new if have == 0 else mx.concatenate([frontier.pooled, new], axis=1)
         if num_blocks * B * self.head_dim * 4 > _qsa_pool_retention_max_bytes():
             # Size eviction: return the exact answer, drop the retained state.
