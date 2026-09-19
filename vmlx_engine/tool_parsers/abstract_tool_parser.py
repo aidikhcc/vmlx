@@ -10,7 +10,7 @@ import json
 import re
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -343,7 +343,8 @@ class ToolParser(ABC):
 
     @classmethod
     def _recover_doubled_wrapper_calls(
-        cls, text: str, *, allowed_names: set[str] | None
+        cls, text: str, *, allowed_names: set[str] | None,
+        argument_parser: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         if not allowed_names:
             return []
@@ -360,7 +361,8 @@ class ToolParser(ABC):
                     break
             if next_real is not None:
                 body = body[:next_real]
-            arguments = cls._recovery_arguments_from_body(body)
+            arguments = (argument_parser(name, body) if argument_parser is not None
+                         else cls._recovery_arguments_from_body(body))
             if not arguments:
                 for key, value in cls._RECOVERY_MISKEYED_PARAM.findall(body):
                     key = key.strip()

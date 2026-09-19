@@ -322,3 +322,93 @@ class TestEscapingIsData:
         args = json.loads(out.tool_calls[0]["arguments"])
         assert args["content"] == payload
         assert args["path"] == "out/x.txt"
+
+
+class TestDeclaredStringParameters:
+    """XML carries raw string bodies; JSON-looking source must not become JSON data."""
+
+    @staticmethod
+    def request(prop, flat=False):
+        fn = {"name": "write_file", "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "content": prop,
+        }}}
+        return {"tools": [{"type": "function", **fn} if flat else {"type": "function", "function": fn}]}
+
+    @staticmethod
+    def block(payload):
+        return ("<tool_call>\n<function=write_file>\n<parameter=path>\n123\n</parameter>\n"
+                f"<parameter=content>\n{payload}\n</parameter>\n</function>\n</tool_call>")
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["chat", "responses"])
+    @pytest.mark.parametrize("prop", [
+        {"type": "string"}, {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        {"oneOf": [{"type": "null"}, {"type": "string"}]},
+    ])
+    @pytest.mark.parametrize("payload", [
+        '{"count":1000}\n', '[1, 2]', '123', 'true', 'false',
+        '"quoted\\ntext"', '  {"nested": "日本語"}\n\n', '<value>literal</value>',
+    ])
+    def test_schema_controls_xml_string_decoding(self, parser, flat, prop, payload):
+        request = self.request(prop, flat)
+        block = self.block(payload)
+        result = parser.extract_tool_calls(block, request)
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"path": "123", "content": payload}
+        streamed = parser.extract_tool_calls_streaming("", block, "</tool_call>", request=request)
+        assert json.loads(streamed["tool_calls"][0]["function"]["arguments"]) == args
+
+    @pytest.mark.parametrize("payload", ["null", "None", "nil", "  null\n"])
+    def test_plain_string_null_spelling_is_not_null(self, parser, payload):
+        result = parser.extract_tool_calls(self.block(payload), self.request({"type": "string"}))
+        assert json.loads(result.tool_calls[0]["arguments"])["content"] == payload
+
+    @pytest.mark.parametrize("prop", [
+        {"type": ["string", "null"]}, {"type": "string", "nullable": True},
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    ])
+    def test_nullable_null_contract_is_retained(self, parser, prop):
+        result = parser.extract_tool_calls(self.block("null"), self.request(prop))
+        assert json.loads(result.tool_calls[0]["arguments"])["content"] is None
+
+    @pytest.mark.parametrize("prop,payload,expected", [
+        ({"type": "object"}, '{"n":1}', {"n": 1}),
+        ({"type": "array"}, '[1,2]', [1, 2]),
+        ({"type": "boolean"}, 'false', False),
+        ({"type": "integer"}, '123', 123),
+        ({}, '{"n":1}', {"n": 1}),
+        ({"type": ["string", "object"]}, '{"n":1}', {"n": 1}),
+    ])
+    def test_non_string_or_ambiguous_schemas_retain_native_json(self, parser, prop, payload, expected):
+        result = parser.extract_tool_calls(self.block(payload), self.request(prop))
+        assert json.loads(result.tool_calls[0]["arguments"])["content"] == expected
+
+    @pytest.mark.parametrize("variant", ["missing_open", "missing_close", "doubled", "invoke", "ornith", "miskeyed"])
+    def test_existing_xml_recoveries_keep_the_schema(self, parser, variant):
+        value = '{"n":1}'
+        block = self.block(value)
+        if variant == "missing_open":
+            block = block.removeprefix("<tool_call>\n")
+        elif variant == "missing_close":
+            block = block.removesuffix("\n</tool_call>")
+        elif variant == "doubled":
+            block = block.replace("<function=write_file>", "<function=function><function=write_file>")
+        elif variant == "invoke":
+            block = '<tool_call><invoke><tool_name>write_file</tool_name><arguments><content>{"n":1}</content></arguments></invoke></tool_call>'
+        elif variant == "ornith":
+            block = '<tool_call><function=write_file><arg_key>content</arg_key><value>{"n":1}</value></function></tool_call>'
+        elif variant == "miskeyed":
+            block = '<tool_call><function=write_file><function=content>{"n":1}</parameter></function></tool_call>'
+        result = parser.extract_tool_calls(block, self.request({"type": "string"}))
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "write_file"
+        assert json.loads(result.tool_calls[0]["arguments"])["content"] == value
+
+    def test_each_function_uses_its_own_schema(self, parser):
+        request = self.request({"type": "string"})
+        request["tools"].append({"type": "function", "name": "record_data", "parameters": {
+            "properties": {"content": {"type": "object"}},
+        }})
+        block = self.block('{"n":1}') + self.block('{"n":1}').replace("function=write_file", "function=record_data")
+        result = parser.extract_tool_calls(block, request)
+        assert [json.loads(c["arguments"])["content"] for c in result.tool_calls] == ['{"n":1}', {"n": 1}]

@@ -109,11 +109,19 @@ class XMLFunctionToolParser(ToolParser):
         return value
 
     @classmethod
-    def _coerce_value(cls, value: str) -> Any:
+    def _coerce_value(cls, value: str, prop_schema: Any = None) -> Any:
         # Strip only to TEST for a JSON shape (and the <value> wrapper); the
         # string result keeps its own bytes — indentation, trailing newlines,
         # literal backslash sequences — exactly as the model wrote them.
         raw = cls._unframe(value)
+        # The native template emits string parameters verbatim, but JSON for
+        # non-strings. Decode using the declared type BEFORE json.loads loses
+        # string bytes: JSON source code, numeric filenames, "null", quotes,
+        # escapes and trailing whitespace can all be legitimate string data.
+        if cls._schema_is_string_or_null(prop_schema):
+            if cls._schema_allows_null(prop_schema) and raw.strip().lower() in cls._NULL_SPELLINGS:
+                return None
+            return raw
         candidate = raw.strip()
         wrapped = cls.VALUE_WRAPPER_PATTERN.match(candidate)
         if wrapped:
@@ -123,6 +131,30 @@ class XMLFunctionToolParser(ToolParser):
             return json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
             return raw
+
+    @classmethod
+    def _schema_is_string_or_null(cls, prop: Any) -> bool:
+        if not isinstance(prop, dict):
+            return False
+        typ = prop.get("type")
+        if typ == "string":
+            return True
+        if isinstance(typ, (list, tuple)):
+            return "string" in typ and all(t in ("string", "null") for t in typ)
+        for key in ("anyOf", "oneOf"):
+            options = prop.get(key)
+            if isinstance(options, list) and options:
+                strings = [cls._schema_is_string_or_null(o) for o in options]
+                if any(strings) and all(is_string or (isinstance(o, dict) and o.get("type") == "null")
+                                        for o, is_string in zip(options, strings)):
+                    return True
+        return False
+
+    @classmethod
+    def _argument_properties(cls, request: dict[str, Any] | None, name: str) -> dict[str, Any]:
+        schema = cls._function_schema_for_tool(request, name)
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        return props if isinstance(props, dict) else {}
 
     # _request_tool_names and the doubled-wrapper recovery live on ToolParser:
     # the malformed shape arrives on both the qwen and xml_function routes.
@@ -142,7 +174,9 @@ class XMLFunctionToolParser(ToolParser):
         return cls._extract_arguments_from_body(body)
 
     @classmethod
-    def _extract_arguments_from_body(cls, body: str) -> dict[str, Any]:
+    def _extract_arguments_from_body(
+        cls, body: str, properties: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Extract args trying strict `<parameter=K>V</parameter>` first, the
         Ornith `<arg_key>K</arg_key><value>V</value>` fallback, then the
         Qwen3.6 miskeyed `<function=K>V</parameter>` shape (correct function
@@ -150,22 +184,24 @@ class XMLFunctionToolParser(ToolParser):
         Responses stream path as an empty-args call the required-args
         validator then dropped)."""
         arguments: dict[str, Any] = {}
+        properties = properties or {}
         for param_name, param_value in cls.PARAM_PATTERN.findall(body):
-            arguments[param_name.strip()] = cls._coerce_value(param_value)
+            arguments[param_name.strip()] = cls._coerce_value(param_value, properties.get(param_name.strip()))
         if not arguments:
             for k, v in cls._RECOVERY_SPLIT_KEY_PARAM.findall(body):
-                arguments[k.strip()] = cls._coerce_value(v)
+                arguments[k.strip()] = cls._coerce_value(v, properties.get(k.strip()))
         if not arguments:
             for k, v in cls.ORNITH_ARG_KEY_VALUE_PATTERN.findall(body):
-                arguments[k.strip()] = cls._coerce_value(v)
+                arguments[k.strip()] = cls._coerce_value(v, properties.get(k.strip()))
         if not arguments:
             for k, v in cls._RECOVERY_MISKEYED_PARAM.findall(body):
-                arguments[k.strip()] = cls._coerce_value(v)
+                arguments[k.strip()] = cls._coerce_value(v, properties.get(k.strip()))
         return arguments
 
     @classmethod
     def _parse_functions(
-        cls, text: str, *, allowed_names: set[str] | None = None
+        cls, text: str, *, allowed_names: set[str] | None = None,
+        request: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         tool_calls: list[dict[str, Any]] = []
         matches = list(cls.FUNCTION_PATTERN.findall(text))
@@ -176,7 +212,7 @@ class XMLFunctionToolParser(ToolParser):
             name = func_name.strip()
             if allowed_names is not None and name not in allowed_names:
                 continue
-            arguments = cls._extract_arguments_from_body(body)
+            arguments = cls._extract_arguments_from_body(body, cls._argument_properties(request, name))
             tool_calls.append(
                 {
                     "id": generate_tool_id(),
@@ -188,7 +224,8 @@ class XMLFunctionToolParser(ToolParser):
 
     @classmethod
     def _parse_nested_invoke_functions(
-        cls, text: str, *, allowed_names: set[str] | None = None
+        cls, text: str, *, allowed_names: set[str] | None = None,
+        request: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         tool_calls: list[dict[str, Any]] = []
         for body in cls.INVOKE_PATTERN.findall(text):
@@ -199,11 +236,12 @@ class XMLFunctionToolParser(ToolParser):
             if allowed_names is not None and name not in allowed_names:
                 continue
             arguments: dict[str, Any] = {}
+            properties = cls._argument_properties(request, name)
             args_match = cls.ARGUMENTS_PATTERN.search(body)
             if args_match:
                 args_body = args_match.group(1)
                 for arg_name, arg_value in cls.SIMPLE_XML_ARG_PATTERN.findall(args_body):
-                    arguments[arg_name.strip()] = cls._coerce_value(arg_value)
+                    arguments[arg_name.strip()] = cls._coerce_value(arg_value, properties.get(arg_name.strip()))
             tool_calls.append(
                 {
                     "id": generate_tool_id(),
@@ -237,7 +275,7 @@ class XMLFunctionToolParser(ToolParser):
                 and "<function=" in model_output
             ):
                 repaired_calls = self._parse_functions(
-                    model_output, allowed_names=allowed_names
+                    model_output, allowed_names=allowed_names, request=request
                 )
                 if repaired_calls:
                     cleaned_text = self._strip_repaired_function_blocks(model_output)
@@ -255,7 +293,7 @@ class XMLFunctionToolParser(ToolParser):
         tool_calls: list[dict[str, Any]] = []
         allowed_names_for_recovery = self._request_tool_names(request)
         for block in self.TOOL_CALL_PATTERN.findall(model_output):
-            parsed = self._parse_functions(block)
+            parsed = self._parse_functions(block, request=request)
             # A doubled `<function=function>` wrapper parses as one bogus call
             # named "function" with no arguments; recover the real nested call
             # when the request's tool names disambiguate it.
@@ -264,13 +302,15 @@ class XMLFunctionToolParser(ToolParser):
                 for call in parsed
             ):
                 recovered = self._recover_doubled_wrapper_calls(
-                    block, allowed_names=allowed_names_for_recovery
+                    block, allowed_names=allowed_names_for_recovery,
+                    argument_parser=lambda name, body: self._extract_arguments_from_body(
+                        body, self._argument_properties(request, name)),
                 )
                 if recovered:
                     parsed = recovered
             tool_calls.extend(parsed)
             if not tool_calls:
-                tool_calls.extend(self._parse_nested_invoke_functions(block))
+                tool_calls.extend(self._parse_nested_invoke_functions(block, request=request))
 
         cleaned_text = self.TOOL_CALL_PATTERN.sub("", model_output).strip()
         if not tool_calls:
@@ -279,6 +319,7 @@ class XMLFunctionToolParser(ToolParser):
                 repaired_calls = self._parse_functions(
                     model_output,
                     allowed_names=allowed_names,
+                    request=request,
                 )
                 if repaired_calls:
                     cleaned_text = self._strip_repaired_function_blocks(model_output)
@@ -291,6 +332,7 @@ class XMLFunctionToolParser(ToolParser):
                 repaired_calls = self._parse_nested_invoke_functions(
                     model_output,
                     allowed_names=allowed_names,
+                    request=request,
                 )
                 if repaired_calls:
                     cleaned_text = self._strip_repaired_function_blocks(model_output)
