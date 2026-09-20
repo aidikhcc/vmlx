@@ -51,6 +51,22 @@
       letter-spacing: 0.01em;
     }
 
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+    }
+
+    #speed-test {
+      min-height: 36px;
+      padding: 0 0.75rem;
+      background: #2a333c;
+      color: var(--ink);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72rem;
+      font-weight: 500;
+    }
+
     .status {
       display: flex;
       align-items: center;
@@ -58,6 +74,12 @@
       font-family: "IBM Plex Mono", monospace;
       font-size: 0.75rem;
       color: var(--muted);
+    }
+
+    #speed-readout {
+      color: var(--copper);
+      min-width: 7.5rem;
+      text-align: right;
     }
 
     .filament {
@@ -156,6 +178,15 @@
 
     .error { color: var(--warn); }
 
+    .speed {
+      margin-top: 0.55rem;
+      padding-top: 0.45rem;
+      border-top: 1px dashed var(--line);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72rem;
+      color: var(--copper);
+    }
+
     form {
       display: grid;
       grid-template-columns: auto 1fr auto;
@@ -238,9 +269,13 @@
 </head>
 <body>
   <header>
-    <div class="brand">Local Qwen</div>
+    <div class="brand-wrap">
+      <div class="brand">Local Qwen</div>
+      <button id="speed-test" type="button">Speed test</button>
+    </div>
     <div class="status">
       <div class="filament" aria-hidden="true"></div>
+      <span id="speed-readout">— tok/s</span>
       <span id="status">Looking for the model…</span>
     </div>
   </header>
@@ -268,6 +303,8 @@
     const logEl = document.getElementById("log");
     const emptyEl = document.getElementById("empty");
     const statusEl = document.getElementById("status");
+    const speedReadoutEl = document.getElementById("speed-readout");
+    const speedTestEl = document.getElementById("speed-test");
     const promptEl = document.getElementById("prompt");
     const keyEl = document.getElementById("key");
     const sendEl = document.getElementById("send");
@@ -277,10 +314,103 @@
     let apiBase = "";
     let modelName = "mlx-community/Qwen3.8-27B-4bit";
     let pendingImage = null;
+    let lastTokPerSec = null;
 
     function setBusy(busy) {
       document.body.classList.toggle("is-busy", busy);
       sendEl.disabled = busy;
+      speedTestEl.disabled = busy;
+    }
+
+    function formatTokPerSec(tokens, seconds) {
+      if (!tokens || !seconds || seconds <= 0) return null;
+      return tokens / seconds;
+    }
+
+    function rememberSpeed(tokPerSec) {
+      if (!tokPerSec) return;
+      lastTokPerSec = tokPerSec;
+      speedReadoutEl.textContent = tokPerSec.toFixed(1) + " tok/s";
+    }
+
+    function attachSpeedLine(wrap, tokens, decodeSec, wallSec) {
+      // The first token is the "startup" word. Speed after that is the fair number.
+      const decodeTokens = tokens > 1 ? tokens - 1 : tokens;
+      const decode = formatTokPerSec(decodeTokens, decodeSec);
+      const endToEnd = formatTokPerSec(tokens, wallSec);
+      const line = document.createElement("div");
+      line.className = "speed";
+      if (decode) {
+        line.textContent = decode.toFixed(1) + " tok/s after first word  ·  " +
+          tokens + " tokens in " + decodeSec.toFixed(2) + " s";
+        rememberSpeed(decode);
+      } else if (endToEnd) {
+        line.textContent = endToEnd.toFixed(1) + " tok/s including startup  ·  " +
+          tokens + " tokens in " + wallSec.toFixed(2) + " s";
+        rememberSpeed(endToEnd);
+      } else {
+        line.textContent = "Speed: not enough tokens to measure yet.";
+      }
+      wrap.appendChild(line);
+    }
+
+    async function streamCompletion(body, onDelta) {
+      const started = performance.now();
+      let firstTokenAt = null;
+      let finishedAt = started;
+      let tokenCount = 0;
+      const res = await fetch((apiBase || "") + "/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + keyEl.value.trim()
+        },
+        body: JSON.stringify(Object.assign({
+          model: modelName,
+          stream: true,
+          stream_options: { include_usage: true }
+        }, body))
+      });
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(res.status === 401
+          ? "The local key is wrong. It should look like vmlx_local_qwen38."
+          : "Server error " + res.status + ": " + raw.slice(0, 240));
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop();
+        for (const part of parts) {
+          const line = part.split("\n").find(function (row) { return row.startsWith("data:"); });
+          if (!line) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") continue;
+          let data;
+          try { data = JSON.parse(payload); } catch (err) { continue; }
+          const usage = data.usage;
+          if (usage && usage.completion_tokens) tokenCount = usage.completion_tokens;
+          const delta = data.choices && data.choices[0] && data.choices[0].delta;
+          if (!delta) continue;
+          const piece = (delta.content || "") + (delta.reasoning_content || "");
+          if (piece) {
+            if (firstTokenAt === null) firstTokenAt = performance.now();
+            finishedAt = performance.now();
+            if (!usage) tokenCount += 1;
+          }
+          if (onDelta) onDelta(delta);
+        }
+      }
+      return {
+        tokens: tokenCount,
+        decodeSec: firstTokenAt ? (finishedAt - firstTokenAt) / 1000 : 0,
+        wallSec: (performance.now() - started) / 1000
+      };
     }
 
     function setLive(ok, text) {
@@ -406,68 +536,68 @@
 
       setBusy(true);
       try {
-        const res = await fetch((apiBase || "") + "/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + keyEl.value.trim()
-          },
-          body: JSON.stringify({
-            model: modelName,
-            messages: messages,
-            stream: true,
-            temperature: 0.4,
-            max_tokens: 1024
-          })
-        });
-
-        if (!res.ok) {
-          const raw = await res.text();
-          throw new Error(res.status === 401
-            ? "The local key is wrong. It should look like vmlx_local_qwen38."
-            : "Server error " + res.status + ": " + raw.slice(0, 240));
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
         let answer = "";
         let thinking = "";
-
-        while (true) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          buffer += decoder.decode(chunk.value, { stream: true });
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop();
-          for (const part of parts) {
-            const line = part.split("\n").find(function (row) { return row.startsWith("data:"); });
-            if (!line) continue;
-            const payload = line.slice(5).trim();
-            if (payload === "[DONE]") continue;
-            let data;
-            try { data = JSON.parse(payload); } catch (err) { continue; }
-            const delta = data.choices && data.choices[0] && data.choices[0].delta;
-            if (!delta) continue;
-            if (delta.reasoning_content) {
-              thinking += delta.reasoning_content;
-              thinkEl.hidden = false;
-              thinkEl.textContent = thinking;
-            }
-            if (delta.content) {
-              answer += delta.content;
-              reply.body.textContent = answer;
-            }
-            logEl.scrollTop = logEl.scrollHeight;
+        const timing = await streamCompletion({
+          messages: messages,
+          temperature: 0.4,
+          max_tokens: 1024
+        }, function (delta) {
+          if (delta.reasoning_content) {
+            thinking += delta.reasoning_content;
+            thinkEl.hidden = false;
+            thinkEl.textContent = thinking;
           }
-        }
+          if (delta.content) {
+            answer += delta.content;
+            reply.body.textContent = answer;
+          }
+          logEl.scrollTop = logEl.scrollHeight;
+        });
 
         if (!answer) answer = reply.body.textContent;
         messages.push({ role: "assistant", content: answer || "(no text)" });
         if (!answer) reply.body.textContent = thinking ? "Finished thinking, but sent no final sentence." : "(no text)";
+        attachSpeedLine(reply.wrap, timing.tokens, timing.decodeSec, timing.wallSec);
       } catch (err) {
         reply.body.className = "error";
         reply.body.textContent = err.message || String(err);
+        console.error(err);
+      } finally {
+        setBusy(false);
+        detectApi();
+      }
+    });
+
+    speedTestEl.addEventListener("click", async function () {
+      localStorage.setItem("vmlx_api_key", keyEl.value.trim());
+      const card = addBubble("assistant", "Running a speed test…");
+      setBusy(true);
+      try {
+        let answer = "";
+        const timing = await streamCompletion({
+          messages: [{
+            role: "user",
+            content: "Write the numbers 1 through 60 separated by spaces. No other words."
+          }],
+          temperature: 0,
+          max_tokens: 160,
+          enable_thinking: false
+        }, function (delta) {
+          if (delta.content) {
+            answer += delta.content;
+            card.body.textContent = answer;
+            logEl.scrollTop = logEl.scrollHeight;
+          }
+        });
+        if (!answer) card.body.textContent = "The speed test finished, but no words came back.";
+        attachSpeedLine(card.wrap, timing.tokens, timing.decodeSec, timing.wallSec);
+        if (timing.tokens && timing.decodeSec) {
+          card.wrap.querySelector(".who").textContent = "Speed test";
+        }
+      } catch (err) {
+        card.body.className = "error";
+        card.body.textContent = err.message || String(err);
         console.error(err);
       } finally {
         setBusy(false);

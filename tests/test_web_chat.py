@@ -23,11 +23,14 @@ def test_browser_accept_gets_html_and_clients_still_see_ollama(monkeypatch):
     page = client.get("/", headers={"Accept": "text/html"})
     assert page.status_code == 200
     assert "Local Qwen" in page.text
+    assert "Speed test" in page.text
     assert "text/html" in page.headers.get("content-type", "")
 
     chat = client.get("/chat")
     assert chat.status_code == 200
     assert "Local Qwen" in chat.text
+    assert "Speed test" in chat.text
+    assert "tok/s" in chat.text
 
 
 def test_bootstrap_gives_loopback_key_only(monkeypatch):
