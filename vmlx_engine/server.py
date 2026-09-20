@@ -6264,6 +6264,7 @@ app = FastAPI(
     version=__import__("vmlx_engine").__version__,
     lifespan=lifespan,
 )
+register_web_chat(app)
 
 
 @app.exception_handler(OllamaRequestValidationError)
