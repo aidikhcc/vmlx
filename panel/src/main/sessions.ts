@@ -111,8 +111,11 @@ import {
 } from '../shared/detectedFamilyNames'
 import { cacheTypeRequiresPaged } from '../shared/cacheTypeCapabilities'
 import {
+  corsOriginsLaunchArgs,
   filterAdditionalArgs,
+  finiteNonNegativeInteger,
   finitePositiveInteger,
+  generateVmlxApiKey,
 } from '../shared/launchArgValues'
 import { buildNativeMtpLaunchArgs, resolveNativeMtpStartupMode } from '../shared/nativeMtpLaunchArgs'
 import { planSessionConfigSave } from '../shared/sessionConfigLifecycle'
@@ -3360,10 +3363,17 @@ export class SessionManager extends EventEmitter {
         })`,
       )
     }
-    // Pass API key via env var (not CLI arg) to avoid exposure in ps aux
-    if (config.apiKey) {
-      spawnEnv.VLLM_API_KEY = config.apiKey
+    // Pass API key via env var (not CLI arg) to avoid exposure in ps aux.
+    // If the user left it blank, create a local key so the API is not open.
+    if (!String(config.apiKey || '').trim()) {
+      config.apiKey = generateVmlxApiKey()
+      db.updateSession(sessionId, { config: JSON.stringify(config) })
+      this.pushLog(
+        sessionId,
+        '[SECURITY] Generated a local API key. Clients must send Authorization: Bearer <key>.',
+      )
     }
+    spawnEnv.VLLM_API_KEY = config.apiKey
     // Pass cluster secret via env var for distributed compute (same reason as API key)
     const clusterSecret = (config as any).distributedSecret
     if (clusterSecret) {
@@ -5104,7 +5114,7 @@ export class SessionManager extends EventEmitter {
     args.push('--port', config.port.toString())
     args.push('--timeout', resolvedEngineTimeoutSeconds(config).toString())
 
-    const rateLimit = finitePositiveInteger(config.rateLimit)
+    const rateLimit = finiteNonNegativeInteger(config.rateLimit)
     if (rateLimit != null) args.push('--rate-limit', rateLimit.toString())
     // API key passed via VLLM_API_KEY env var in spawn (not CLI arg) to avoid exposure in ps aux
 
@@ -5136,7 +5146,7 @@ export class SessionManager extends EventEmitter {
       if (effectiveMfluxClass) args.push('--mflux-class', effectiveMfluxClass)
       // Logging + CORS still apply to image servers
       if (config.logLevel && config.logLevel !== 'INFO') args.push('--log-level', config.logLevel)
-      if (config.corsOrigins && config.corsOrigins !== '*') args.push('--allowed-origins', config.corsOrigins)
+      args.push(...corsOriginsLaunchArgs(config.corsOrigins))
       // Strip image-specific flags from additionalArgs to prevent duplication
       // (stale additionalArgs may survive config merge from a previous session)
       if (config.additionalArgs?.trim()) {
@@ -5552,10 +5562,8 @@ export class SessionManager extends EventEmitter {
       args.push('--log-level', config.logLevel)
     }
 
-    // CORS
-    if (config.corsOrigins && config.corsOrigins !== '*') {
-      args.push('--allowed-origins', config.corsOrigins)
-    }
+    // CORS — empty/loopback uses the engine localhost-only default
+    args.push(...corsOriginsLaunchArgs(config.corsOrigins))
 
     // Additional arguments — strip stale image-only flags from old session configs
     if (config.additionalArgs?.trim()) {

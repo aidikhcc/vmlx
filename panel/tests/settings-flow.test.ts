@@ -116,7 +116,7 @@ const DEFAULT_CONFIG: SessionConfig = {
     host: '127.0.0.1',
     port: 8000,
     apiKey: '',
-    rateLimit: 0,
+    rateLimit: 60,
     timeout: 300,
     maxNumSeqs: 1,
     prefillBatchSize: 512,
@@ -178,7 +178,7 @@ const DEFAULT_CONFIG: SessionConfig = {
     additionalArgs: '',
     enableJit: true,
     logLevel: 'INFO',
-    corsOrigins: '*',
+    corsOrigins: '',
     maxContextLength: 0
 }
 
@@ -334,6 +334,17 @@ function finitePositiveInteger(value: unknown): number | undefined {
     return number == null ? undefined : Math.max(1, Math.floor(number))
 }
 
+function finiteNonNegativeInteger(value: unknown): number | undefined {
+    const number = finiteNonNegativeNumber(value)
+    return number == null ? undefined : Math.max(0, Math.floor(number))
+}
+
+function corsOriginsLaunchArgs(corsOrigins: string | undefined): string[] {
+    const value = (corsOrigins ?? '').trim()
+    if (!value || value === 'loopback') return []
+    return ['--allowed-origins', value]
+}
+
 function filterAdditionalArgs(raw: string | undefined, blockedFlags: Set<string>): string[] {
     if (!raw?.trim()) return []
     const extra = raw.trim().split(/\s+/).filter(Boolean)
@@ -410,7 +421,7 @@ function buildCommandPreview(
     parts.push('--timeout', effectiveSessionTimeoutSeconds(config, detectedFamily).toString())
 
     if (config.apiKey) parts.push('# VLLM_API_KEY=*** (env var)')
-    const rateLimit = finitePositiveInteger(config.rateLimit)
+    const rateLimit = finiteNonNegativeInteger(config.rateLimit)
     if (rateLimit != null) parts.push('--rate-limit', rateLimit.toString())
 
     const effectiveMaxNumSeqs = dsv4Active ? 1 : finitePositiveInteger(config.maxNumSeqs)
@@ -570,7 +581,7 @@ function buildCommandPreview(
     if (config.logLevel && config.logLevel !== 'INFO') parts.push('--log-level', config.logLevel)
 
     // CORS
-    if (config.corsOrigins && config.corsOrigins !== '*') parts.push('--allowed-origins', config.corsOrigins)
+    parts.push(...corsOriginsLaunchArgs(config.corsOrigins))
 
     const maxContextLength = finitePositiveInteger(config.maxContextLength)
     if (maxContextLength != null) parts.push('--max-prompt-tokens', maxContextLength.toString())
@@ -675,9 +686,9 @@ describe('Server Settings', () => {
         expect(getFlagValue(out, '--rate-limit')).toBe('120')
     })
 
-    it('omits rate limit when 0', () => {
+    it('emits --rate-limit 0 when unlimited', () => {
         const out = preview({ rateLimit: 0 })
-        expect(hasFlag(out, '--rate-limit')).toBe(false)
+        expect(getFlagValue(out, '--rate-limit')).toBe('0')
     })
 })
 
@@ -3314,8 +3325,13 @@ describe('Default IP and New Settings', () => {
         expect(getFlagValue(out, '--log-level')).toBe('DEBUG')
     })
 
-    it('corsOrigins * (default) does not emit --allowed-origins flag', () => {
+    it('corsOrigins * explicitly allows every website', () => {
         const out = preview({ corsOrigins: '*' })
+        expect(getFlagValue(out, '--allowed-origins')).toBe('*')
+    })
+
+    it('empty corsOrigins uses the engine loopback default', () => {
+        const out = preview({ corsOrigins: '' })
         expect(hasFlag(out, '--allowed-origins')).toBe(false)
     })
 
@@ -3331,7 +3347,8 @@ describe('Default IP and New Settings', () => {
 
     it('default config has all new fields', () => {
         expect(DEFAULT_CONFIG.logLevel).toBe('INFO')
-        expect(DEFAULT_CONFIG.corsOrigins).toBe('*')
+        expect(DEFAULT_CONFIG.corsOrigins).toBe('')
+        expect(DEFAULT_CONFIG.rateLimit).toBe(60)
         expect(DEFAULT_CONFIG.maxContextLength).toBe(0)
         expect(DEFAULT_CONFIG.enableJit).toBe(true)
         expect(DEFAULT_CONFIG.defaultTemperature).toBe(0)
@@ -4619,14 +4636,14 @@ describe('Settings → CLI Round-Trip Completeness', () => {
         // Defaults should NOT produce these flags:
         expect(normalized).not.toContain('--api-key')
         expect(normalized).not.toContain('VLLM_API_KEY')  // apiKey is empty
-        expect(normalized).not.toContain('--rate-limit')     // rateLimit is 0
+        expect(normalized).toContain('--rate-limit 60')
         expect(normalized).not.toContain('--is-mllm')        // isMultimodal is undefined/false
         expect(normalized).not.toContain('--disable-prefix-cache')  // cache stack is enabled by default
         expect(normalized).not.toContain('--enable-disk-cache')    // generic default uses block SSD L2
         expect(normalized).not.toContain('--speculative-model')     // no speculative model
         expect(normalized).not.toContain('--embedding-model')       // empty
         expect(normalized).not.toContain('--log-level')             // INFO is default (not emitted)
-        expect(normalized).not.toContain('--allowed-origins')       // * is default (not emitted)
+        expect(normalized).not.toContain('--allowed-origins')       // empty = engine loopback default
         expect(normalized).not.toContain('--max-prompt-tokens')     // unset by default; explicit user value emits it
         expect(normalized).not.toContain('--default-temperature')   // request/CLI/bundle metadata resolve sampling
         expect(normalized).not.toContain('--default-top-p')         // do not poison bundles with generic UI defaults

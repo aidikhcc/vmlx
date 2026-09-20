@@ -229,6 +229,7 @@ include = ["vmlx_engine*"]
 
 [tool.setuptools.package-data]
 vmlx_engine = [
+    "web_ui_chat.html",
     "chat_templates/*.jinja",
     "config/*.yaml",
     "metal/*.metal",

@@ -320,11 +320,11 @@ def test_command_preview_uses_runtime_numeric_sanitizers_for_core_flags() -> Non
     ]
 
     for expression in (
-        "finitePositiveInteger(config.rateLimit)",
-        "finitePositiveInteger(config.maxNumSeqs)",
-        "finitePositiveInteger(config.prefillBatchSize)",
+        "finiteNonNegativeInteger(config.rateLimit)",
+        "finitePositiveInteger(concurrency.maxNumSeqs)",
+        "finitePositiveInteger(concurrency.prefillBatchSize)",
         "finitePositiveInteger(config.prefillStepSize)",
-        "finitePositiveInteger(config.completionBatchSize)",
+        "finitePositiveInteger(concurrency.completionBatchSize)",
         # kvCacheGroupSize left this list when generic --kv-cache-quantization
         # emission was retired (stored/live cache is exact everywhere); the
         # panel no longer sends a group size at all.

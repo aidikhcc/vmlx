@@ -93,7 +93,9 @@ vmlx serve mlx-community/Qwen3-8B-4bit
 
 > **Note:** On macOS 14+, bare `pip install` fails with "externally-managed-environment". Use `uv`, `pipx`, or a venv.
 
-The vMLX inference server is now running at `http://0.0.0.0:8000` with an OpenAI + Anthropic compatible API. Works with any model from [mlx-community](https://huggingface.co/mlx-community) -- thousands of models ready to go.
+The vMLX inference server is now running at `http://127.0.0.1:8000` with an OpenAI + Anthropic compatible API. Works with any model from [mlx-community](https://huggingface.co/mlx-community) -- thousands of models ready to go.
+
+On first start, vMLX prints a **local API key** (it starts with `vmlx_`). This is not an OpenAI or Hugging Face key. Copy it into your client as `Authorization: Bearer …`, or set `VLLM_API_KEY` / `--api-key` to reuse the same key. Use `--allow-unauthenticated` only on localhost if you want the old open behavior.
 
 ### Or download the desktop app
 
@@ -104,7 +106,7 @@ Get [MLX Studio](https://github.com/jjang-ai/mlxstudio/releases/latest) -- a nat
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="vmlx_your_local_key")
 response = client.chat.completions.create(
     model="local",
     messages=[{"role": "user", "content": "Hello!"}],
@@ -119,7 +121,7 @@ for chunk in response:
 ```python
 import anthropic
 
-client = anthropic.Anthropic(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = anthropic.Anthropic(base_url="http://localhost:8000/v1", api_key="vmlx_your_local_key")
 message = client.messages.create(
     model="local",
     max_tokens=1024,
@@ -132,6 +134,7 @@ print(message.content[0].text)
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer vmlx_your_local_key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "local",

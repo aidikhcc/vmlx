@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Qwen chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --night: #12171c;
+      --panel: #1c242c;
+      --ink: #e7e2d4;
+      --muted: #8b93a0;
+      --copper: #c4844a;
+      --lamp: #7cb89a;
+      --warn: #d07a6a;
+      --line: rgba(231, 226, 212, 0.12);
+      --user: #24303a;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--night);
+      color: var(--ink);
+      font-family: "Atkinson Hyperlegible", Georgia, serif;
+    }
+
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.9rem 1.2rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .brand {
+      font-family: Syne, sans-serif;
+      font-size: 1.15rem;
+      letter-spacing: 0.01em;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+
+    .filament {
+      width: 2.4rem;
+      height: 0.28rem;
+      border-radius: 99px;
+      background: #3a444e;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .filament::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: var(--copper);
+      transform: scaleX(0);
+      transform-origin: left;
+      transition: transform 200ms ease;
+    }
+
+    body.is-live .filament::after { transform: scaleX(1); background: var(--lamp); }
+    body.is-busy .filament::after {
+      background: var(--copper);
+      animation: pulse 1.1s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.35; }
+      50% { opacity: 1; }
+    }
+
+    #log {
+      overflow-y: auto;
+      padding: 1.25rem 1.1rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+
+    .empty {
+      margin: auto;
+      max-width: 28rem;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    .empty strong {
+      display: block;
+      color: var(--ink);
+      font-family: Syne, sans-serif;
+      font-size: 1.35rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .bubble {
+      max-width: min(42rem, 100%);
+      padding: 0.85rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 4px 14px 14px 14px;
+      background: var(--panel);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.5;
+    }
+
+    .bubble.user {
+      margin-left: auto;
+      background: var(--user);
+      border-radius: 14px 4px 14px 14px;
+    }
+
+    .who {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.7rem;
+      color: var(--copper);
+      margin-bottom: 0.35rem;
+    }
+
+    .think {
+      color: var(--muted);
+      font-style: italic;
+      font-size: 0.92rem;
+      margin-bottom: 0.55rem;
+      padding-bottom: 0.55rem;
+      border-bottom: 1px dashed var(--line);
+    }
+
+    .thumb {
+      display: block;
+      max-width: 12rem;
+      max-height: 9rem;
+      margin-bottom: 0.5rem;
+      border-radius: 8px;
+    }
+
+    .error { color: var(--warn); }
+
+    form {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 0.55rem;
+      padding: 0.8rem 1rem 1rem;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    textarea, input[type="password"], button {
+      font: inherit;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 3.1rem;
+      max-height: 9rem;
+      resize: vertical;
+      padding: 0.7rem 0.8rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--night);
+      color: var(--ink);
+    }
+
+    textarea:focus, input:focus, button:focus-visible {
+      outline: 2px solid var(--copper);
+      outline-offset: 2px;
+    }
+
+    button, .file-btn {
+      min-height: 44px;
+      min-width: 44px;
+      border: 0;
+      border-radius: 10px;
+      background: var(--copper);
+      color: #1a120c;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: 0.45; cursor: wait; }
+
+    .file-btn {
+      display: grid;
+      place-items: center;
+      background: #2a333c;
+      color: var(--ink);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72rem;
+    }
+
+    #file { position: absolute; width: 1px; height: 1px; opacity: 0; }
+
+    .key-row {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .key-row input {
+      flex: 1;
+      min-height: 36px;
+      padding: 0.3rem 0.55rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--night);
+      color: var(--ink);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.75rem;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .filament::after { animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Local Qwen</div>
+    <div class="status">
+      <div class="filament" aria-hidden="true"></div>
+      <span id="status">Looking for the model…</span>
+    </div>
+  </header>
+
+  <main id="log">
+    <div class="empty" id="empty">
+      <strong>Talk to the model on this Mac</strong>
+      Use <code>http://127.0.0.1:8000/</code> — not https. Type below and press Send.
+    </div>
+  </main>
+
+  <form id="composer">
+    <label class="file-btn" for="file">Photo</label>
+    <input id="file" type="file" accept="image/*">
+    <textarea id="prompt" placeholder="Ask anything…" autofocus></textarea>
+    <button id="send" type="submit">Send</button>
+    <div class="key-row">
+      <label for="key">Local key</label>
+      <input id="key" type="password" autocomplete="off" spellcheck="false">
+    </div>
+  </form>
+
+  <script>
+    // This page talks to the local vMLX API on the same computer.
+    const logEl = document.getElementById("log");
+    const emptyEl = document.getElementById("empty");
+    const statusEl = document.getElementById("status");
+    const promptEl = document.getElementById("prompt");
+    const keyEl = document.getElementById("key");
+    const sendEl = document.getElementById("send");
+    const fileEl = document.getElementById("file");
+
+    const messages = [];
+    let apiBase = "";
+    let modelName = "mlx-community/Qwen3.8-27B-4bit";
+    let pendingImage = null;
+
+    function setBusy(busy) {
+      document.body.classList.toggle("is-busy", busy);
+      sendEl.disabled = busy;
+    }
+
+    function setLive(ok, text) {
+      document.body.classList.toggle("is-live", ok);
+      statusEl.textContent = text;
+    }
+
+    function addBubble(role, text, extra) {
+      emptyEl.remove();
+      const wrap = document.createElement("div");
+      wrap.className = "bubble " + role;
+      const who = document.createElement("div");
+      who.className = "who";
+      who.textContent = role === "user" ? "You" : "Qwen";
+      wrap.appendChild(who);
+      if (extra && extra.image) {
+        const img = document.createElement("img");
+        img.className = "thumb";
+        img.alt = "Attached picture";
+        img.src = extra.image;
+        wrap.appendChild(img);
+      }
+      if (extra && extra.thinkEl) wrap.appendChild(extra.thinkEl);
+      const body = document.createElement("div");
+      body.className = extra && extra.error ? "error" : "body";
+      body.textContent = text;
+      wrap.appendChild(body);
+      logEl.appendChild(wrap);
+      logEl.scrollTop = logEl.scrollHeight;
+      return { wrap, body, thinkEl: extra && extra.thinkEl };
+    }
+
+    async function detectApi() {
+      const candidates = ["", "http://127.0.0.1:8000"];
+      for (const base of candidates) {
+        try {
+          const res = await fetch(base + "/health");
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (data.model_name) modelName = data.model_name;
+          apiBase = base;
+          if (data.model_loaded) {
+            setLive(true, data.model_name + " is ready");
+          } else {
+            setLive(false, "Server is up, model still loading");
+          }
+          return;
+        } catch (err) {
+          console.warn("Health check failed for", base, err);
+        }
+      }
+      setLive(false, "Cannot reach http://127.0.0.1:8000");
+    }
+
+    async function loadKey() {
+      const saved = localStorage.getItem("vmlx_api_key");
+      try {
+        const res = await fetch("/chat/bootstrap");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.model) modelName = data.model;
+          if (data.api_key) {
+            keyEl.value = data.api_key;
+            localStorage.setItem("vmlx_api_key", data.api_key);
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn("Bootstrap unavailable", err);
+      }
+      keyEl.value = saved || "vmlx_local_qwen38";
+    }
+
+    function readImage(file) {
+      return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onload = function () { resolve(reader.result); };
+        reader.onerror = function () { reject(reader.error); };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    fileEl.addEventListener("change", async function () {
+      const file = fileEl.files && fileEl.files[0];
+      if (!file) {
+        pendingImage = null;
+        return;
+      }
+      try {
+        pendingImage = await readImage(file);
+        setLive(document.body.classList.contains("is-live"), "Picture attached");
+      } catch (err) {
+        addBubble("assistant", "Could not read that picture.", { error: true });
+        console.error(err);
+      }
+    });
+
+    document.getElementById("composer").addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const text = promptEl.value.trim();
+      const image = pendingImage;
+      if (!text && !image) return;
+
+      localStorage.setItem("vmlx_api_key", keyEl.value.trim());
+      promptEl.value = "";
+      pendingImage = null;
+      fileEl.value = "";
+
+      const userContent = image
+        ? [
+            { type: "text", text: text || "What is in this picture?" },
+            { type: "image_url", image_url: { url: image } }
+          ]
+        : text;
+      messages.push({ role: "user", content: userContent });
+      addBubble("user", text || "What is in this picture?", { image: image });
+
+      const thinkEl = document.createElement("div");
+      thinkEl.className = "think";
+      thinkEl.hidden = true;
+      const reply = addBubble("assistant", "");
+      reply.wrap.insertBefore(thinkEl, reply.body);
+
+      setBusy(true);
+      try {
+        const res = await fetch((apiBase || "") + "/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + keyEl.value.trim()
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: messages,
+            stream: true,
+            temperature: 0.4,
+            max_tokens: 1024
+          })
+        });
+
+        if (!res.ok) {
+          const raw = await res.text();
+          throw new Error(res.status === 401
+            ? "The local key is wrong. It should look like vmlx_local_qwen38."
+            : "Server error " + res.status + ": " + raw.slice(0, 240));
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let answer = "";
+        let thinking = "";
+
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop();
+          for (const part of parts) {
+            const line = part.split("\n").find(function (row) { return row.startsWith("data:"); });
+            if (!line) continue;
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            let data;
+            try { data = JSON.parse(payload); } catch (err) { continue; }
+            const delta = data.choices && data.choices[0] && data.choices[0].delta;
+            if (!delta) continue;
+            if (delta.reasoning_content) {
+              thinking += delta.reasoning_content;
+              thinkEl.hidden = false;
+              thinkEl.textContent = thinking;
+            }
+            if (delta.content) {
+              answer += delta.content;
+              reply.body.textContent = answer;
+            }
+            logEl.scrollTop = logEl.scrollHeight;
+          }
+        }
+
+        if (!answer) answer = reply.body.textContent;
+        messages.push({ role: "assistant", content: answer || "(no text)" });
+        if (!answer) reply.body.textContent = thinking ? "Finished thinking, but sent no final sentence." : "(no text)";
+      } catch (err) {
+        reply.body.className = "error";
+        reply.body.textContent = err.message || String(err);
+        console.error(err);
+      } finally {
+        setBusy(false);
+        detectApi();
+      }
+    });
+
+    promptEl.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        document.getElementById("composer").requestSubmit();
+      }
+    });
+
+    loadKey();
+    detectApi();
+    setInterval(detectApi, 8000);
+  </script>
+</body>
+</html>

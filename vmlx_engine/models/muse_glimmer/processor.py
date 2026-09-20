@@ -114,6 +114,12 @@ class MuseGlimmerImageProcessor:
             if text.startswith(("http://", "https://")):
                 import urllib.request
 
+                from vmlx_engine.http_security import MediaUrlError, validate_outbound_media_url
+
+                try:
+                    validate_outbound_media_url(text)
+                except MediaUrlError as exc:
+                    raise ValueError(str(exc)) from exc
                 with urllib.request.urlopen(text, timeout=60) as response:
                     return Image.open(io.BytesIO(response.read()))
             return Image.open(text)

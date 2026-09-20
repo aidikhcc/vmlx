@@ -106,6 +106,11 @@ def _uvicorn_bind_kwargs(args, log_level: str) -> dict:
     else:
         kwargs["host"] = args.host
         kwargs["port"] = args.port
+    ssl_certfile = getattr(args, "ssl_certfile", None)
+    ssl_keyfile = getattr(args, "ssl_keyfile", None)
+    if ssl_certfile and ssl_keyfile:
+        kwargs["ssl_certfile"] = ssl_certfile
+        kwargs["ssl_keyfile"] = ssl_keyfile
     return kwargs
 
 
@@ -1542,7 +1547,51 @@ def serve_command(args):
         )
         sys.exit(1)
 
-    server._api_key = args.api_key or os.environ.get("VLLM_API_KEY")
+    from .http_security import (
+        DEFAULT_RATE_LIMIT,
+        ServeSecurityError,
+        apply_trust_remote_code_env,
+        resolve_serve_security,
+    )
+
+    try:
+        _security = resolve_serve_security(
+            host=getattr(args, "host", "127.0.0.1"),
+            api_key=getattr(args, "api_key", None),
+            env_api_key=os.environ.get("VLLM_API_KEY"),
+            allow_unauthenticated=bool(getattr(args, "allow_unauthenticated", False)),
+            allow_insecure_lan=bool(getattr(args, "allow_insecure_lan", False)),
+            allowed_origins=getattr(args, "allowed_origins", None),
+            rate_limit=int(getattr(args, "rate_limit", DEFAULT_RATE_LIMIT)),
+            trust_forwarded_for=bool(getattr(args, "trust_proxy", False)),
+            trust_remote_code=True if getattr(args, "trust_remote_code", False) else None,
+            no_trust_remote_code=bool(getattr(args, "no_trust_remote_code", False)),
+            model_name=getattr(args, "model", None),
+            ssl_certfile=getattr(args, "ssl_certfile", None),
+            ssl_keyfile=getattr(args, "ssl_keyfile", None),
+            uds=getattr(args, "uds", None),
+        )
+    except ServeSecurityError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+    server._api_key = _security.api_key
+    server._allowed_origins = _security.allowed_origins
+    server._trust_forwarded_for = _security.trust_forwarded_for
+    args.allowed_origins = _security.allowed_origins
+    args.rate_limit = _security.rate_limit
+    apply_trust_remote_code_env(_security.trust_remote_code)
+    if _security.generated_api_key:
+        print()
+        print("=" * 60)
+        print("  Generated local API key (not OpenAI / Hugging Face):")
+        print(f"  {_security.api_key}")
+        print("  Clients must send: Authorization: Bearer <this key>")
+        print("  Reuse it next time with --api-key or VLLM_API_KEY.")
+        print("  Use --allow-unauthenticated only on 127.0.0.1 if you")
+        print("  truly need the old open-localhost behavior.")
+        print("=" * 60)
+        print()
+        logger.info("Generated a local API key because none was provided")
     server._private_cache_attestation_enabled = False
     server._private_cache_attestation_token = None
     _private_attestation_enabled = bool(
@@ -2387,14 +2436,14 @@ def serve_command(args):
     print("=" * 60)
     print("SECURITY CONFIGURATION")
     print("=" * 60)
-    if args.api_key:
+    if server._api_key:
         print("  Authentication: ENABLED (API key required)")
     else:
-        print("  Authentication: DISABLED - Use --api-key to enable")
+        print("  Authentication: DISABLED (--allow-unauthenticated)")
     if args.rate_limit > 0:
         print(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
     else:
-        print("  Rate limiting: DISABLED - Use --rate-limit to enable")
+        print("  Rate limiting: DISABLED (--rate-limit 0)")
     print(f"  Request timeout: {args.timeout}s")
     if args.enable_auto_tool_choice:
         _effective_tool_parser = server._tool_call_parser or args.tool_call_parser
@@ -2781,9 +2830,7 @@ def serve_command(args):
     logging.basicConfig(level=getattr(logging, log_level, logging.INFO), force=True)
     server._log_level = log_level
 
-    # Configure CORS
-    allowed_origins = getattr(args, 'allowed_origins', '*')
-    server._allowed_origins = allowed_origins
+    # CORS origins were resolved in the serve-security plan above.
 
     # Configure JIT compilation. --no-jit is the final word: several policy
     # blocks above can turn enable_jit ON by themselves (the JANG-affine
@@ -2910,30 +2957,9 @@ def serve_command(args):
         server._cli_args['speculative_model'] = getattr(args, 'speculative_model', None)
         server._cli_args['num_draft_tokens'] = getattr(args, 'num_draft_tokens', 3)
 
-    # Configure CORS middleware
-    from fastapi.middleware.cors import CORSMiddleware
-    origins = [o.strip() for o in allowed_origins.split(',') if o.strip()]
-    # CORS spec: allow_credentials=True is invalid with origins=["*"]
-    # Only enable credentials when specific origins are listed
-    has_wildcard = '*' in origins
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=not has_wildcard,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    from .http_security import configure_cors
 
-    # Security warning: 0.0.0.0 exposes server to the network
-    if args.host == '0.0.0.0' and not server._api_key:
-        print()
-        print("=" * 60)
-        print("  WARNING: Server binding to 0.0.0.0 (all interfaces)")
-        print("  with no API key set. Any device on your network can")
-        print("  access this server. Set --api-key or change --host")
-        print("  to 127.0.0.1 for local-only access.")
-        print("=" * 60)
-        print()
+    configure_cors(app, getattr(args, "allowed_origins", server._allowed_origins))
 
     # Start server
     if getattr(args, "uds", None):
@@ -4059,8 +4085,49 @@ Examples:
         type=str,
         default=None,
         help="Require this API key for all requests. Clients must send it as "
-             "'Authorization: Bearer <key>'. Without this, anyone with network access "
-             "can use your model. Example: --api-key sk-my-secret-key",
+             "'Authorization: Bearer <key>'. If omitted, vMLX generates a local "
+             "key and prints it. This is not an OpenAI or Hugging Face key.",
+    )
+    serve_parser.add_argument(
+        "--allow-unauthenticated",
+        action="store_true",
+        help="Allow requests without an API key. Only permitted on 127.0.0.1 or --uds. "
+             "A page in your browser can then call the local API. Do not use with PHI.",
+    )
+    serve_parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=None,
+        help="TLS certificate file. Required with --ssl-keyfile for non-localhost binds.",
+    )
+    serve_parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=None,
+        help="TLS private key file. Required with --ssl-certfile for non-localhost binds.",
+    )
+    serve_parser.add_argument(
+        "--allow-insecure-lan",
+        action="store_true",
+        help="Allow --host 0.0.0.0 (or another LAN address) without TLS. "
+             "Use only on a trusted private network.",
+    )
+    serve_parser.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="Trust the X-Forwarded-For header for rate limiting. "
+             "Enable only behind a reverse proxy you control.",
+    )
+    serve_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow a Hugging Face model to run its bundled Python. "
+             "Default is off for hub IDs and on for local folders.",
+    )
+    serve_parser.add_argument(
+        "--no-trust-remote-code",
+        action="store_true",
+        help="Never run bundled model Python, even for local folders.",
     )
     serve_parser.add_argument(
         "--enable-private-cache-attestation",
@@ -4076,9 +4143,9 @@ Examples:
     serve_parser.add_argument(
         "--rate-limit",
         type=int,
-        default=0,
-        help="Maximum requests per minute per client IP. Prevents abuse from a single "
-             "client overwhelming the server. 0 = no limit. Example: --rate-limit 60",
+        default=60,
+        help="Maximum requests per minute per client IP (default: 60). "
+             "0 = no limit. Example: --rate-limit 60",
     )
     serve_parser.add_argument(
         "--timeout",
@@ -4388,9 +4455,10 @@ Examples:
     serve_parser.add_argument(
         "--allowed-origins",
         type=str,
-        default="*",
-        help="Comma-separated list of allowed CORS origins for browser-based API consumers. "
-             "Use * to allow all origins. Example: http://localhost:3000,https://myapp.com (default: *)",
+        default="loopback",
+        help="Comma-separated CORS origins. Default 'loopback' allows only "
+             "http://127.0.0.1 and http://localhost (any port). "
+             "Use * to allow every website. Example: https://aidi.khcc.jo",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

@@ -825,35 +825,26 @@ class TestToolSandboxHighRiskTools:
     """Tests for high-risk tool detection."""
 
     def test_high_risk_tool_warning(self, caplog):
-        """Test that high-risk tools trigger warning."""
-        import logging
-
+        """Test that high-risk tools are blocked."""
         sandbox = ToolSandbox()
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(MCPSecurityError, match="high-risk pattern"):
             sandbox.validate_tool_execution(
                 tool_name="execute_command",
                 server_name="test",
                 arguments={"cmd": "ls"},
             )
 
-        assert "High-risk tool detected" in caplog.text
-        assert "execute" in caplog.text
-
     def test_high_risk_shell_tool(self, caplog):
-        """Test that shell tools trigger warning."""
-        import logging
-
+        """Test that shell tools are blocked."""
         sandbox = ToolSandbox()
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(MCPSecurityError, match="high-risk pattern"):
             sandbox.validate_tool_execution(
                 tool_name="run_shell",
                 server_name="test",
                 arguments={},
             )
-
-        assert "High-risk tool detected" in caplog.text
 
 
 class TestCustomBlockedPatterns:

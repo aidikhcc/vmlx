@@ -39,7 +39,9 @@ import {
 } from '../../../../shared/cacheTypeCapabilities'
 import { computeEffectiveJit, resolveRequestedJit } from '../../../../shared/jitPolicy'
 import {
+  corsOriginsLaunchArgs,
   filterAdditionalArgs,
+  finiteNonNegativeInteger,
   finitePositiveInteger,
 } from '../../../../shared/launchArgValues'
 import { buildNativeMtpLaunchArgs, resolveNativeMtpStartupMode } from '../../../../shared/nativeMtpLaunchArgs'
@@ -361,7 +363,7 @@ function buildCommandPreview(
   parts.push('--timeout', effectiveSessionTimeoutSeconds(config, detectedFamily).toString())
 
   if (config.apiKey) parts.push('# VLLM_API_KEY=*** (env var)')
-  const rateLimit = finitePositiveInteger(config.rateLimit)
+  const rateLimit = finiteNonNegativeInteger(config.rateLimit)
   if (rateLimit != null) parts.push('--rate-limit', rateLimit.toString())
 
   // Concurrent processing
@@ -552,9 +554,7 @@ function buildCommandPreview(
   if (config.logLevel && config.logLevel !== 'INFO') {
     parts.push('--log-level', config.logLevel)
   }
-  if (config.corsOrigins && config.corsOrigins !== '*') {
-    parts.push('--allowed-origins', config.corsOrigins)
-  }
+  parts.push(...corsOriginsLaunchArgs(config.corsOrigins))
 
   if (config.additionalArgs && config.additionalArgs.trim()) {
     const filtered = filterAdditionalArgs(

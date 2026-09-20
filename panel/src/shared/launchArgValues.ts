@@ -22,6 +22,8 @@ export const ADDITIONAL_ARG_VALUE_FLAGS = new Set([
   '--block-disk-cache-max-percent',
   '--allowed-origins',
   '--api-key',
+  '--ssl-certfile',
+  '--ssl-keyfile',
   '--cache-memory-mb',
   '--cache-memory-percent',
   '--cache-ttl-minutes',
@@ -102,6 +104,27 @@ export function finiteNonNegativeNumber(value: unknown): number | undefined {
 export function finitePositiveInteger(value: unknown): number | undefined {
   const number = finitePositiveNumber(value)
   return number == null ? undefined : Math.max(1, Math.floor(number))
+}
+
+/** Non-negative integer, including 0 (used for --rate-limit 0 = unlimited). */
+export function finiteNonNegativeInteger(value: unknown): number | undefined {
+  const number = finiteNonNegativeNumber(value)
+  return number == null ? undefined : Math.max(0, Math.floor(number))
+}
+
+/** Empty or "loopback" means the engine default (localhost pages only). */
+export function corsOriginsLaunchArgs(corsOrigins: string | undefined): string[] {
+  const value = (corsOrigins ?? '').trim()
+  if (!value || value === 'loopback') return []
+  return ['--allowed-origins', value]
+}
+
+export function generateVmlxApiKey(): string {
+  const bytes = new Uint8Array(18)
+  crypto.getRandomValues(bytes)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return `vmlx_${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')}`
 }
 
 /**

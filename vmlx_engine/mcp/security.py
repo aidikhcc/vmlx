@@ -509,15 +509,14 @@ class ToolSandbox:
         )
 
     def _check_high_risk_tool(self, tool_name: str) -> None:
-        """Check if tool matches high-risk patterns."""
+        """Block tools whose names look like shell/eval unless explicitly allowed."""
         tool_lower = tool_name.lower()
         for pattern in HIGH_RISK_TOOL_PATTERNS:
             if pattern in tool_lower:
-                logger.warning(
-                    f"High-risk tool detected: '{tool_name}' matches pattern '{pattern}'. "
-                    f"Ensure this tool is from a trusted MCP server."
+                raise MCPSecurityError(
+                    f"Tool '{tool_name}' matches high-risk pattern '{pattern}'. "
+                    "Add it to the MCP allow-list only after review."
                 )
-                break
 
     def _validate_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """Validate tool arguments for dangerous patterns."""

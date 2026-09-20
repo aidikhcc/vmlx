@@ -3762,6 +3762,13 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
     Raises:
         FileSizeExceededError: If image exceeds max_size
     """
+    from ..http_security import MediaUrlError, validate_outbound_media_url
+
+    try:
+        validate_outbound_media_url(url)
+    except MediaUrlError as exc:
+        raise ValueError(str(exc)) from exc
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
@@ -3769,7 +3776,7 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
     # First, make a HEAD request to check Content-Length
     try:
         head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+            url, timeout=timeout, headers=headers, allow_redirects=False, verify=True
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -3782,7 +3789,12 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         pass
 
     response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+        url,
+        timeout=timeout,
+        headers=headers,
+        stream=True,
+        verify=True,
+        allow_redirects=False,
     )
     response.raise_for_status()
 
@@ -3850,6 +3862,13 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
     Raises:
         FileSizeExceededError: If video exceeds max_size
     """
+    from ..http_security import MediaUrlError, validate_outbound_media_url
+
+    try:
+        validate_outbound_media_url(url)
+    except MediaUrlError as exc:
+        raise ValueError(str(exc)) from exc
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
@@ -3859,7 +3878,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
     # First, make a HEAD request to check Content-Length
     try:
         head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+            url, timeout=timeout, headers=headers, allow_redirects=False, verify=True
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -3872,7 +3891,12 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         pass
 
     response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+        url,
+        timeout=timeout,
+        headers=headers,
+        stream=True,
+        verify=True,
+        allow_redirects=False,
     )
     response.raise_for_status()
 

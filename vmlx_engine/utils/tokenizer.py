@@ -1189,12 +1189,11 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None, ski
         )
 
     tokenizer_config = tokenizer_config or {}
-    # Q1 (audit-2026-04-07): trust_remote_code=True silences the noisy HF
-    # warning on load for models with custom tokenizer_config classes
-    # (e.g. nemotron_h) and unblocks any custom tokenizer code path. Safe
-    # because model paths served by vMLX come from user-local disk or
-    # trusted JANG pipelines. Only set if caller didn't already override.
-    tokenizer_config.setdefault("trust_remote_code", True)
+    # Default off for Hugging Face hub IDs. Serve sets VMLX_TRUST_REMOTE_CODE
+    # after reviewing --trust-remote-code / local-folder policy.
+    from ..http_security import env_trust_remote_code
+
+    tokenizer_config.setdefault("trust_remote_code", env_trust_remote_code(default=False))
 
     # Check if local path exists before loading
     model_path = Path(model_name)

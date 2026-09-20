@@ -72,6 +72,7 @@ from typing import Any
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from .web_ui import chat_html_response, register_web_chat, wants_browser_page
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
@@ -6464,12 +6465,13 @@ class RateLimiter:
             return True, 0
 
 
-# Global rate limiter (disabled by default)
+# Global rate limiter (serve_command enables the default 60/min)
 _rate_limiter = RateLimiter(requests_per_minute=60, enabled=False)
 
 # Settings configured via CLI (set in cli.py serve_command)
 _log_level: str = "INFO"
-_allowed_origins: str = "*"
+_allowed_origins: str = "loopback"
+_trust_forwarded_for: bool = False
 _enable_jit: bool = False
 _jang_metadata: dict | None = None  # Cached at model load time for /health
 _model_type: str = "text"  # "text" or "image" — auto-detected from model directory
@@ -6892,13 +6894,10 @@ def _remove_jit_compilation() -> bool:
 
 async def check_rate_limit(request: Request):
     """Rate limiting dependency."""
-    # Use client IP for per-client rate limiting.
-    # X-Forwarded-For for reverse proxy setups, then direct IP, then "unknown".
-    client_id = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or (request.client.host if request.client else None)
-        or "unknown"
-    )
+    from .http_security import rate_limit_client_id
+
+    # Direct client IP unless the operator passed --trust-proxy.
+    client_id = rate_limit_client_id(request, _trust_forwarded_for)
 
     allowed, retry_after = _rate_limiter.is_allowed(client_id)
     if not allowed:
@@ -9058,6 +9057,7 @@ def load_model(
     max_tokens_explicit: bool = False,
     max_prompt_tokens: int | None = None,
     force_mllm: bool = False,
+    trust_remote_code: bool | None = None,
     served_model_name: str | None = None,
     smelt: bool = False,
     smelt_experts: int = 50,
@@ -9346,8 +9346,15 @@ def load_model(
     _lifecycle_progress.report(phase=_lifecycle_progress.PHASE_LOADING_WEIGHTS)
     if use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
+        from .http_security import env_trust_remote_code
+
         _engine = BatchedEngine(
             model_name=model_name,
+            trust_remote_code=(
+                env_trust_remote_code(default=False)
+                if trust_remote_code is None
+                else trust_remote_code
+            ),
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
@@ -9357,7 +9364,17 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
+        from .http_security import env_trust_remote_code
+
+        _engine = SimpleEngine(
+            model_name=model_name,
+            trust_remote_code=(
+                env_trust_remote_code(default=False)
+                if trust_remote_code is None
+                else trust_remote_code
+            ),
+            force_mllm=force_mllm,
+        )
         # Start SimpleEngine — asyncio.run() crashes inside a running event loop
         # (e.g., when called from admin_wake during deep sleep recovery).
         # Detect and skip; the engine's lazy start will handle it on first request.
@@ -9647,13 +9664,17 @@ def _reject_unsupported_logprobs_request(
 
 
 @app.get("/")
-async def ollama_root():
-    """Ollama-compatible root probe.
+async def ollama_root(request: Request):
+    """Ollama-compatible root probe, or the browser chat page.
 
     Several clients verify an Ollama provider with GET/HEAD / before
     probing /api/version. Real Ollama returns a plain text liveness string;
     returning 404 here makes those clients report a generic version failure.
+    Web browsers send Accept: text/html, so they get the local chat window
+    instead of that probe string.
     """
+    if wants_browser_page(request):
+        return chat_html_response()
     return Response(content="Ollama is running\n", media_type="text/plain")
 
 
@@ -14014,8 +14035,11 @@ async def admin_soft_sleep():
             return {"status": "soft_sleep"}
 
         except Exception as e:
-            logger.error(f"Failed to enter soft sleep: {e}")
-            return {"error": str(e)}
+            logger.error("Failed to enter soft sleep: %s", e, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": "An error occurred. Please contact support."},
+            )
 
 
 @app.post("/admin/deep-sleep", dependencies=[Depends(verify_api_key)])
@@ -14124,13 +14148,17 @@ async def admin_deep_sleep():
             return {"status": "deep_sleep"}
 
         except Exception as e:
-            logger.error(f"Failed to enter deep sleep: {e}")
-            return {"error": str(e)}
+            logger.error("Failed to enter deep sleep: %s", e, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": "An error occurred. Please contact support."},
+            )
 
 
 async def _admin_wake_impl():
     """Reload from standby while the caller owns ``_wake_lock``."""
     global _engine, _standby_state, _pre_sleep_cache_limit, _model_load_error
+    from starlette.responses import JSONResponse
 
     if _standby_state is None:
         return {"status": "already_active"}
@@ -14261,12 +14289,15 @@ async def _admin_wake_impl():
                 return {"error": "No model name saved — cannot reload"}
 
     except Exception as e:
-        logger.error(f"Failed to wake from sleep: {e}")
+        logger.error("Failed to wake from sleep: %s", e, exc_info=True)
         # Clear standby state to prevent infinite JIT wake retry loop.
         # Server stays alive but reports error via /health.
         _standby_state = None
-        _model_load_error = f"Wake failed: {e}"
-        return {"error": str(e)}
+        _model_load_error = "Wake failed"
+        return JSONResponse(
+            status_code=500,
+            content={"error": "An error occurred. Please contact support."},
+        )
 
 
 async def _wake_with_lock_held():
@@ -19240,9 +19271,15 @@ async def create_transcription(
             local_stt = _stt_engine
 
         # Save uploaded file temporarily
+        from .http_security import validate_audio_upload
+
+        content = await file.read()
+        try:
+            validate_audio_upload(file.filename, len(content))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         ext = os.path.splitext(file.filename)[1] if file.filename else ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".wav") as tmp:
-            content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
@@ -29959,7 +29996,50 @@ Examples:
         "--api-key",
         type=str,
         default=None,
-        help="API key for authentication (if not set, no auth required)",
+        help="API key for authentication. If omitted, a local key is generated.",
+    )
+    parser.add_argument(
+        "--allow-unauthenticated",
+        action="store_true",
+        help="Allow requests without an API key (localhost / --uds only)",
+    )
+    parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=None,
+        help="TLS certificate file for HTTPS",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=None,
+        help="TLS private key file for HTTPS",
+    )
+    parser.add_argument(
+        "--allow-insecure-lan",
+        action="store_true",
+        help="Allow a non-localhost bind without TLS",
+    )
+    parser.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="Trust X-Forwarded-For for rate limiting",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow Hugging Face hub models to run bundled Python",
+    )
+    parser.add_argument(
+        "--no-trust-remote-code",
+        action="store_true",
+        help="Never run bundled model Python",
+    )
+    parser.add_argument(
+        "--allowed-origins",
+        type=str,
+        default="loopback",
+        help="CORS origins. Default loopback = localhost pages only. Use * for all.",
     )
     parser.add_argument(
         "--enable-private-cache-attestation",
@@ -29981,8 +30061,8 @@ Examples:
     parser.add_argument(
         "--rate-limit",
         type=int,
-        default=0,
-        help="Rate limit requests per minute per client (0 = disabled)",
+        default=60,
+        help="Rate limit requests per minute per client (default: 60, 0 = disabled)",
     )
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
@@ -30106,13 +30186,50 @@ Examples:
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
+    global _allowed_origins, _trust_forwarded_for
     global _private_cache_attestation_enabled, _private_cache_attestation_token
     global _default_temperature, _default_top_p, _default_top_k, _default_min_p, _default_repetition_penalty, _default_enable_thinking
     global _native_mtp_sampling_policy
     global _inference_endpoints, _wake_timeout
     global _smelt_enabled, _smelt_experts
 
-    _api_key = args.api_key or os.environ.get("VLLM_API_KEY")
+    from .http_security import (
+        DEFAULT_RATE_LIMIT,
+        ServeSecurityError,
+        apply_trust_remote_code_env,
+        configure_cors,
+        resolve_serve_security,
+        uvicorn_tls_kwargs,
+    )
+
+    try:
+        _security = resolve_serve_security(
+            host=args.host,
+            api_key=args.api_key,
+            env_api_key=os.environ.get("VLLM_API_KEY"),
+            allow_unauthenticated=bool(getattr(args, "allow_unauthenticated", False)),
+            allow_insecure_lan=bool(getattr(args, "allow_insecure_lan", False)),
+            allowed_origins=getattr(args, "allowed_origins", None),
+            rate_limit=int(getattr(args, "rate_limit", DEFAULT_RATE_LIMIT)),
+            trust_forwarded_for=bool(getattr(args, "trust_proxy", False)),
+            trust_remote_code=True if getattr(args, "trust_remote_code", False) else None,
+            no_trust_remote_code=bool(getattr(args, "no_trust_remote_code", False)),
+            model_name=args.model,
+            ssl_certfile=getattr(args, "ssl_certfile", None),
+            ssl_keyfile=getattr(args, "ssl_keyfile", None),
+        )
+    except ServeSecurityError as exc:
+        parser.error(str(exc))
+    _api_key = _security.api_key
+    _allowed_origins = _security.allowed_origins
+    _trust_forwarded_for = _security.trust_forwarded_for
+    args.rate_limit = _security.rate_limit
+    apply_trust_remote_code_env(_security.trust_remote_code)
+    if _security.generated_api_key:
+        logger.warning(
+            "Generated local API key %s — send Authorization: Bearer <key>",
+            _security.api_key,
+        )
     _private_cache_attestation_enabled = False
     _private_cache_attestation_token = None
     private_attestation_enabled = bool(args.enable_private_cache_attestation)
@@ -30196,11 +30313,11 @@ Examples:
     if _api_key:
         logger.info("  Authentication: ENABLED (API key required)")
     else:
-        logger.warning("  Authentication: DISABLED - Use --api-key to enable")
+        logger.warning("  Authentication: DISABLED (--allow-unauthenticated)")
     if args.rate_limit > 0:
         logger.info(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
     else:
-        logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
+        logger.warning("  Rate limiting: DISABLED (--rate-limit 0)")
     logger.info(f"  Request timeout: {args.timeout}s")
     logger.info("=" * 60)
 
@@ -30311,8 +30428,13 @@ Examples:
         smelt_experts=getattr(args, "smelt_experts", 50),
     )
 
-    # Start server
-    uvicorn.run(app, host=args.host, port=args.port)
+    configure_cors(app, _allowed_origins)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        **uvicorn_tls_kwargs(_security),
+    )
 
 
 if __name__ == "__main__":
